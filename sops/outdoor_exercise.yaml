@@ -1,0 +1,94 @@
+- id: EX-UV-PEAK
+  category: outdoor_exercise
+  severity: warning
+  title: High UV during peak hours
+  intent: >-
+    Running, jogging, cycling, gym-outdoors, sports practice or any sustained
+    physical exertion outdoors in daylight.
+  all_of:
+    - {field: uv_index, op: ">=", value: 8}
+  guidance: >-
+    Advise against unprotected outdoor exertion between 11:00 and 16:00. Recommend
+    broad-spectrum sunscreen, covered arms and a hat, and rescheduling the session to
+    before 09:00 or after 17:00. Note that UV burns skin on overcast days too.
+  cite: [uv_index]
+
+- id: EX-HEAT-STRESS
+  category: outdoor_exercise
+  severity: danger
+  title: Heat stress during exertion
+  intent: >-
+    Physical exertion outdoors when it is hot - running, cycling, football,
+    outdoor training, manual work.
+  all_of:
+    - {field: apparent_temperature, op: ">=", value: 38}
+  guidance: >-
+    Advise against outdoor exertion entirely at this apparent temperature. State that
+    heat exhaustion risk is material, not a comfort question. Recommend moving the
+    activity indoors, or to before sunrise. If the activity cannot be moved, advise
+    500 ml of water per 30 minutes and mandatory shade breaks every 20 minutes.
+  cite: [apparent_temperature, temperature_2m, relative_humidity_2m]
+
+- id: EX-GUST-TWOWHEEL
+  category: outdoor_exercise
+  severity: warning
+  title: Gusts affecting cycling and two-wheelers
+  intent: >-
+    Cycling, biking, riding a scooter or motorcycle, or anything on two wheels -
+    whether framed as exercise or as getting somewhere.
+  all_of:
+    - {field: wind_gusts_10m, op: ">", value: 40}
+  guidance: >-
+    Treat this as a safety risk, not a comfort issue. Gusts at this speed can move a
+    bicycle or two-wheeler across a lane without warning, and the risk is worst on
+    bridges, flyovers, open stretches and when overtaking trucks. Recommend a heavier
+    bike or a four-wheeler, and avoiding exposed routes.
+  cite: [wind_gusts_10m, wind_speed_10m]
+
+- id: EX-FAVOURABLE
+  category: outdoor_exercise
+  severity: info
+  title: Conditions favourable for outdoor exercise
+  intent: >-
+    Any outdoor exercise question when nothing hazardous is present in the data.
+  all_of:
+    - {field: uv_index, op: "<", value: 6}
+    - {field: precipitation_probability, op: "<", value: 30}
+    - {field: wind_gusts_10m, op: "<", value: 25}
+    - {field: apparent_temperature, op: ">=", value: 5}
+    - {field: apparent_temperature, op: "<=", value: 32}
+  guidance: >-
+    Conditions are within normal limits for outdoor exercise. State that plainly, give
+    the observed values so the user can judge for themselves, and recommend drinking
+    water before and after the session. No specific volume or interval is prescribed,
+    and no risk beyond what these readings show should be implied.
+  cite: [temperature_2m, apparent_temperature, uv_index, precipitation_probability, wind_gusts_10m]
+
+# The exact logical complement of EX-FAVOURABLE's gate: that one needs every reading
+# in range, this one fires when any reading is out of it. Together they cover every
+# exercise question - without this, a 27 km/h breeze was too windy to be favourable
+# and not windy enough for EX-GUST-TWOWHEEL, and the bot said it had no policy.
+# Where a hazard SOP also fires, it outranks this one on severity.
+- id: EX-CAUTION-BAND
+  category: outdoor_exercise
+  severity: advisory
+  title: Workable for exercise, with a reading outside the comfortable range
+  intent: >-
+    Running, cycling, walking, sports or any outdoor exercise when conditions are not
+    hazardous but not ideal either.
+  any_of:
+    - {field: uv_index, op: ">=", value: 6}
+    - {field: precipitation_probability, op: ">=", value: 30}
+    - {field: wind_gusts_10m, op: ">=", value: 25}
+    - {field: apparent_temperature, op: "<", value: 5}
+    - {field: apparent_temperature, op: ">", value: 32}
+  guidance: >-
+    Outdoor exercise is reasonable, but at least one reading sits outside the
+    comfortable range. Only the readings responsible are named, each with its observed
+    value and what it means for the session. Gusts make headwind stretches harder work, and make bridges,
+    flyovers and junctions less stable for cyclists. A UV index of 6 or more is in the
+    high band, so cover up and use sunscreen around midday. A rain chance of 30 percent
+    or more means carrying a waterproof layer. A feels-like temperature above 32
+    degrees calls for shade breaks and water every 20 minutes; below 5 degrees, extra
+    layers and a longer warm-up. Readings within range are not presented as problems.
+  cite: [temperature_2m, apparent_temperature, uv_index, precipitation_probability, wind_gusts_10m]

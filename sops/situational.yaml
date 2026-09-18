@@ -1,0 +1,41 @@
+# Situational SOPs. `overrides: true` means: when eligible, this SOP becomes the
+# primary answer regardless of which category the user asked about, and is stated
+# before any activity-specific advice. Thresholds follow the IMD 24-hour rainfall
+# classification (moderate 15.6-64.4 mm, heavy 64.5-115.5, very heavy 115.6-204.4).
+- id: SIT-HEAVY-RAIN-SYSTEM
+  category: situational
+  severity: danger
+  title: Active heavy-rainfall system over the location
+  intent: >-
+    Any outdoor activity question at all, of any category, while a heavy rainfall
+    system is over the user's location.
+  overrides: true
+  all_of:
+    - {field: precipitation_sum_24h, op: ">=", value: 64.5}
+  guidance: >-
+    Lead with the rainfall system itself before answering anything about the activity.
+    State the 24-hour rainfall total and that it meets the IMD heavy-rainfall category.
+    Treat every outdoor activity as high severity regardless of what was asked:
+    waterlogging, poor visibility, fallen branches and live wiring are the risks, and
+    none of them appear in a wind or temperature reading. Advise deferring non-essential
+    outdoor plans and checking the IMD district bulletin before going out.
+  cite: [precipitation_sum_24h, precipitation_hours_24h, precipitation_probability, wind_gusts_10m]
+
+- id: SIT-RAIN-SPELL
+  category: situational
+  severity: advisory
+  title: Sustained moderate rainfall over the location
+  intent: >-
+    Any outdoor activity question while a sustained but sub-severe rain spell is
+    running over the user's location.
+  overrides: true
+  all_of:
+    - {field: precipitation_sum_24h, op: ">=", value: 15.6}
+    - {field: precipitation_sum_24h, op: "<", value: 64.5}
+    - {field: precipitation_hours_24h, op: ">=", value: 4}
+  guidance: >-
+    Mention the rain spell before the activity advice, but do not overstate it - this
+    is below the IMD heavy-rainfall category. Give the 24-hour total and how many hours
+    of the day see rain, then answer the activity question on its own terms. Recommend
+    a rain plan rather than cancellation.
+  cite: [precipitation_sum_24h, precipitation_hours_24h, precipitation_probability]

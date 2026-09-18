@@ -1,0 +1,20 @@
+# Fuzzy SOP: deliberately has no numeric gate. Eligibility is decided purely by
+# intent matching, and the judgement is qualitative. See README "The fuzzy SOP".
+- id: LE-PLEASANTNESS
+  category: leisure
+  severity: info
+  title: Qualitative suitability for a casual outing
+  intent: >-
+    Open-ended enjoyment questions with no safety threshold behind them - is today
+    nice for a picnic, good weather for a walk in the park, worth sitting outside,
+    a good evening for a barbecue, pleasant for photographs outdoors.
+  guidance: >-
+    This question has no safety threshold and none should be implied. The answer is a
+    plain verdict - pleasant, acceptable with caveats, or unpleasant - justified from
+    the observed values, naming the one or two readings that decide it. The weighing is
+    about comfort rather than danger: warmth that is agreeable rather than merely safe,
+    whether rain is likely enough to spoil plans, whether wind would disturb food or
+    seating, and whether sun would be harsh on an unshaded spot. The reply should say
+    plainly that this is a comfort judgement and not a safety ruling, and should note
+    that a separate policy covers any genuine hazard.
+  cite: [temperature_2m, apparent_temperature, precipitation_probability, wind_speed_10m, uv_index, relative_humidity_2m]

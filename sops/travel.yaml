@@ -1,0 +1,42 @@
+- id: TR-RAIN-DELAY
+  category: travel
+  severity: advisory
+  title: Rain likely to disrupt travel
+  intent: >-
+    Commuting, driving, flying, catching a train, or setting off on a journey.
+  all_of:
+    - {field: precipitation_probability, op: ">=", value: 70}
+  guidance: >-
+    Warn of probable delays and standing water on the route. Recommend checking the
+    operator or airline for alerts before departure, leaving earlier than planned, and
+    keeping headlights on. This is a disruption warning, not a safety prohibition.
+  cite: [precipitation_probability, precipitation]
+
+- id: TR-LOW-VISIBILITY
+  category: travel
+  severity: warning
+  title: Reduced visibility on the road
+  intent: >-
+    Driving, riding or any road journey where the user needs to see ahead.
+  all_of:
+    - {field: visibility, op: "<", value: 1000}
+  guidance: >-
+    Advise against non-essential road travel. At this visibility, stopping distance
+    exceeds what the driver can see. If travel is unavoidable, recommend low beams
+    rather than high beams, hazard lights when stationary, and no overtaking.
+  cite: [visibility]
+
+- id: TR-GUST-HIGHSIDED
+  category: travel
+  severity: danger
+  title: Severe gusts affecting exposed vehicles
+  intent: >-
+    Travel by two-wheeler, van, truck, or with a roof-box or trailer, and questions
+    about whether it is safe to be on the road in wind.
+  all_of:
+    - {field: wind_gusts_10m, op: ">=", value: 60}
+  guidance: >-
+    Advise against travel by two-wheeler or high-sided vehicle. Gusts at this speed
+    overturn light vehicles on exposed stretches. Recommend postponing, or using a
+    low, heavy four-wheeler and avoiding bridges, coastal roads and flyovers.
+  cite: [wind_gusts_10m, wind_speed_10m]

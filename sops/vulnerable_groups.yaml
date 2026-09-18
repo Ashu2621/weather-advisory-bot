@@ -1,0 +1,44 @@
+- id: VG-CHILD-HEAT
+  category: vulnerable_groups
+  severity: warning
+  title: Heat exposure for children and elderly
+  intent: >-
+    Taking a child, a baby, an elderly parent or anyone frail outdoors - park visits,
+    school runs, playgrounds, walks.
+  all_of:
+    - {field: apparent_temperature, op: ">=", value: 35}
+  guidance: >-
+    Advise against outdoor time for children under 5 and adults over 65 until the
+    apparent temperature drops. Children dehydrate faster than adults and show
+    symptoms later. Recommend shifting the outing to after 17:00, shaded routes only,
+    and water every 20 minutes.
+  cite: [apparent_temperature, temperature_2m, relative_humidity_2m]
+
+- id: VG-COLD-ELDERLY
+  category: vulnerable_groups
+  severity: warning
+  title: Cold exposure for elderly and infants
+  intent: >-
+    Taking an elderly person, an infant, or someone with a heart or respiratory
+    condition outdoors in cold weather.
+  all_of:
+    - {field: apparent_temperature, op: "<=", value: 5}
+  guidance: >-
+    Advise limiting outdoor exposure to short, essential trips. Cold raises blood
+    pressure and provokes angina and asthma. Recommend layered clothing covering the
+    head and hands, and staying indoors during the early morning low.
+  cite: [apparent_temperature, temperature_2m, wind_speed_10m]
+
+- id: VG-PET-PAVEMENT
+  category: vulnerable_groups
+  severity: advisory
+  title: Hot pavement risk for dogs
+  intent: >-
+    Walking a dog or taking a pet outdoors.
+  all_of:
+    - {field: temperature_2m, op: ">=", value: 32}
+  guidance: >-
+    Warn that asphalt can be 20 degrees hotter than the air and burns paw pads.
+    Recommend the five-second back-of-hand test on the pavement before walking,
+    grass routes, and shifting the walk to early morning or after dark.
+  cite: [temperature_2m]
