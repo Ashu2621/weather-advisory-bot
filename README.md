@@ -4,9 +4,12 @@ A LangGraph agent that answers outdoor-activity safety questions from live Open-
 data, and answers **only** from written policy. Every reply either cites a Standard
 Operating Procedure or says no policy applies.
 
+**Live demo:** https://weather-advisory-bot-5evh.onrender.com — free tier, so the first
+request after 15 idle minutes can take about a minute to wake the service.
+
 **Five minutes, in order:**
 
-1. `pytest evals -m "not live"` — 15 cases, no key, no network, about 3 seconds.
+1. `pytest evals -m "not live"` — 16 cases, no key, no network, about 3 seconds.
 2. With a key in `.env`: `uvicorn app.api:app`, open http://localhost:8000, ask
    *"is it safe to cycle in Bhopal today?"*
 3. The live 11th SOP — [Adding the 11th SOP live](#adding-the-11th-sop-live).
@@ -58,12 +61,21 @@ Open **http://localhost:8000**. No build step, no npm. Opening `web/index.html` 
 as a file will not work — the page calls the API on the origin that served it — and
 the page says so if you try.
 
+### Deployment
+
+The live demo is a Render free web service built straight from this repo:
+`pip install -r requirements.txt`, then `uvicorn app.api:app --host 0.0.0.0 --port $PORT`,
+with `GEMINI_API_KEY`, `GEMINI_MODEL` and `PYTHON_VERSION=3.13.1` set in the dashboard.
+Two consequences of the free tier worth knowing: the disk is ephemeral, so the SQLite
+audit log and session memory reset on every redeploy; and every visitor shares one
+free-tier model quota, so when it runs out the bot says so rather than failing.
+
 | Endpoint | Purpose |
 |---|---|
 | `GET /` | chat UI |
 | `POST /chat` | `{session_id, message}` → answer + citation + the readings used |
 | `GET /sops` | the live policy catalogue |
-| `GET /audit` | decision trail, newest first |
+| `GET /audit?token=…` | decision trail, newest first — closed unless `AUDIT_TOKEN` is set (`local-dev` in `.env.example`) |
 | `GET /health` | liveness + SOP count |
 
 ## Evals
@@ -361,19 +373,25 @@ whether the number guard tripped, and the final text. `GET /audit` reads it back
 makes "why did it say that" reconstructable after the fact, including what the weather
 was at the time — which no live re-query can recover.
 
+Because it holds every user's questions, `/audit` is **closed unless `AUDIT_TOKEN` is
+set and supplied**, and an unset variable means closed, not open. The first live
+deployment got this wrong: `/audit` was world-readable on the public URL, found by
+checking the deployment rather than trusting it. `test_27`.
+
 SQLite so there is nothing to install; SQLAlchemy so `DATABASE_URL` can point at
-Postgres without a code change. **SOPs are deliberately *not* in the database** — a
-reviewer adding a policy should drop a file, not write SQL.
+Postgres without a code change (it needs a driver such as `psycopg[binary]` added to
+`requirements.txt`). **SOPs are deliberately *not* in the database** — a reviewer
+adding a policy should drop a file, not write SQL.
 
 ---
 
 ## Eval results
 
 Run on **2026-09-18**, `gemini-3.5-flash-lite`, live Open-Meteo.
-**27 passed, 0 failed, 0 skipped, in 2 m 11 s** (`EVAL_PACE_SECONDS=4`; most of that is
-free-tier rate-limit waits). Fifteen of the twenty-seven need neither a key nor a
+**28 passed, 0 failed, 0 skipped, in 2 m 27 s** (`EVAL_PACE_SECONDS=4`; most of that is
+free-tier rate-limit waits). Sixteen of the twenty-eight need neither a key nor a
 network: `pytest evals -m "not live"`. Several cases exist because something failed
-first — 02b, 08, 22, 24 and 26 — and each is marked in the table with what it found.
+first — 02b, 08, 22, 24, 26 and 27 — and each is marked in the table with what it found.
 
 | # | Case | What it checks | Pass looks like | Result |
 |---|---|---|---|---|
@@ -404,6 +422,7 @@ first — 02b, 08, 22, 24 and 26 — and each is marked in the table with what i
 | 24 | **Model outage** | The model fails too: no key, spent quota, outage | `unavailable`, no citation, says what is wrong — not an HTTP 500 | ✅ pass — **failed first** (was a 500) |
 | 25 | **No policy gap for exercise** | Threshold rules leave holes between gates | Over 2,268 readings straddling every threshold, exactly one of `EX-FAVOURABLE` / `EX-CAUTION-BAND` applies | ✅ pass |
 | 26 | **Only readings that fired reach the reply** | An in-range reading presented as a concern — real number, so the guard cannot see it | Fact sheet and fallback carry exactly the clauses that fired; in-range gusts absent | ✅ pass — found live, see *Honest gaps* #4 |
+| 27 | **Audit log is not public** | The first deployment served every visitor's questions at `/audit` | Closed with no token configured, closed with a wrong one, open with the right one | ✅ pass — found on the live deployment |
 
 ### Case 13 in full — the situational override on live data
 

@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import os
 import pathlib
+import secrets
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
 
@@ -42,7 +44,19 @@ def catalogue() -> list[dict]:
 
 
 @app.get("/audit")
-def audit(limit: int = 50, session_id: str | None = None) -> list[dict]:
+def audit(
+    limit: int = 50,
+    session_id: str | None = None,
+    token: str | None = None,
+    x_audit_token: str | None = Header(default=None),
+) -> list[dict]:
+    """Holds every visitor's questions, so it is closed unless AUDIT_TOKEN is set and
+    supplied (as ?token= or an X-Audit-Token header). Unset means closed, not open: a
+    deployment that forgets the variable must not publish its users' conversations."""
+    expected = os.getenv("AUDIT_TOKEN", "")
+    given = x_audit_token or token or ""
+    if not expected or not secrets.compare_digest(given.encode(), expected.encode()):
+        raise HTTPException(status_code=401, detail="the audit log needs AUDIT_TOKEN")
     return db.recent(limit, session_id)
 
 

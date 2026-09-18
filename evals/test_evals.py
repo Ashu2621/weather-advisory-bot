@@ -500,6 +500,25 @@ def test_26_only_the_readings_that_fired_reach_the_reply():
         assert "21.2" not in text and "wind gusts" not in text.split("Readings")[-1]
 
 
+def test_27_audit_log_is_closed_unless_a_token_is_configured(monkeypatch):
+    """CHECK: the audit log stores every visitor's questions, and the first live
+    deployment served it to anyone who opened /audit.
+    PASS: closed with no token configured, closed with a wrong one, open with the
+    right one - as a query parameter or a header."""
+    from fastapi.testclient import TestClient
+
+    from app import api
+
+    client = TestClient(api.app)
+    monkeypatch.delenv("AUDIT_TOKEN", raising=False)
+    assert client.get("/audit").status_code == 401, "unset must mean closed"
+
+    monkeypatch.setenv("AUDIT_TOKEN", "s3cret")
+    assert client.get("/audit", params={"token": "wrong"}).status_code == 401
+    assert client.get("/audit", params={"token": "s3cret"}).status_code == 200
+    assert client.get("/audit", headers={"X-Audit-Token": "s3cret"}).status_code == 200
+
+
 @pytest.mark.live
 @LIVE
 def test_21_full_graph_on_recorded_severe_weather(monkeypatch):
