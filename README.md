@@ -388,7 +388,7 @@ adding a policy should drop a file, not write SQL.
 ## Eval results
 
 Run on **2026-09-18**, `gemini-3.5-flash-lite`, live Open-Meteo.
-**28 passed, 0 failed, 0 skipped, in 2 m 27 s** (`EVAL_PACE_SECONDS=4`; most of that is
+**28 passed, 0 failed, 0 skipped, in 3 m 13 s** (`EVAL_PACE_SECONDS=4`; most of that is
 free-tier rate-limit waits). Sixteen of the twenty-eight need neither a key nor a
 network: `pytest evals -m "not live"`. Several cases exist because something failed
 first — 02b, 08, 22, 24, 26 and 27 — and each is marked in the table with what it found.

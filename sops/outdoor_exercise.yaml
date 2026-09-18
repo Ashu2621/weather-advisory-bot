@@ -85,10 +85,12 @@
   guidance: >-
     Outdoor exercise is reasonable, but at least one reading sits outside the
     comfortable range. Only the readings responsible are named, each with its observed
-    value and what it means for the session. Gusts make headwind stretches harder work, and make bridges,
-    flyovers and junctions less stable for cyclists. A UV index of 6 or more is in the
-    high band, so cover up and use sunscreen around midday. A rain chance of 30 percent
-    or more means carrying a waterproof layer. A feels-like temperature above 32
-    degrees calls for shade breaks and water every 20 minutes; below 5 degrees, extra
-    layers and a longer warm-up. Readings within range are not presented as problems.
+    value and what it means for the activity the user actually asked about. Gusts make
+    exposed and headwind stretches harder going; only if the activity is cycling or
+    riding, add that bridges, flyovers and junctions become less stable on two wheels.
+    A UV index of 6 or more is in the high band, so cover up and use sunscreen around
+    midday. A rain chance of 30 percent or more means carrying a waterproof layer. A
+    feels-like temperature above 32 degrees calls for shade breaks and water every 20
+    minutes; below 5 degrees, extra layers and a longer warm-up. Readings within range
+    are not presented as problems.
   cite: [temperature_2m, apparent_temperature, uv_index, precipitation_probability, wind_gusts_10m]
