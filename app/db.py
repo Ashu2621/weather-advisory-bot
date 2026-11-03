@@ -24,6 +24,12 @@ load_dotenv()
 DATA = pathlib.Path(__file__).resolve().parent.parent / "data"
 DATA.mkdir(exist_ok=True)
 DB_URL = os.getenv("DATABASE_URL", f"sqlite:///{DATA / 'audit.db'}")
+# Hosts hand out postgres:// URLs; SQLAlchemy wants a driver in the scheme and the
+# LangGraph checkpointer wants plain libpq. PG_URL is empty unless this is Postgres.
+PG_URL = ""
+if DB_URL.startswith(("postgres://", "postgresql://", "postgresql+psycopg://")):
+    PG_URL = "postgresql://" + DB_URL.split("://", 1)[1]
+    DB_URL = "postgresql+psycopg://" + DB_URL.split("://", 1)[1]
 CHECKPOINT_DB = str(DATA / "checkpoints.db")
 
 
@@ -80,8 +86,11 @@ class Decision(Base):
         }
 
 
-engine = create_engine(DB_URL, future=True)
-Base.metadata.create_all(engine)
+engine = create_engine(DB_URL, future=True, pool_pre_ping=True)
+# Replicas start together and each runs the schema setup; on Postgres two concurrent
+# CREATE TABLEs collide in the catalog and one replica crashes. Any fixed number works
+# as the lock id as long as nothing else in the database uses it.
+SCHEMA_LOCK = 724_100
 
 
 def add_missing_columns(eng=engine) -> None:
@@ -89,8 +98,8 @@ def add_missing_columns(eng=engine) -> None:
     was added would fail every insert. Additive columns only; anything bigger gets a
     real migration tool."""
     table = Decision.__tablename__
-    have = {c["name"] for c in inspect(eng).get_columns(table)}
     with eng.begin() as conn:
+        have = {c["name"] for c in inspect(conn).get_columns(table)}
         for col in Decision.__table__.columns:
             if col.name in have:
                 continue
@@ -100,7 +109,17 @@ def add_missing_columns(eng=engine) -> None:
             conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {col.name} {ddl}{default}"))
 
 
-add_missing_columns()
+def init_schema(eng=engine) -> None:
+    with eng.begin() as conn:
+        if eng.dialect.name == "postgresql":
+            # Transaction-scoped: released at commit, so the next replica only gets
+            # the lock once the tables it is about to check for are visible.
+            conn.execute(text("SELECT pg_advisory_xact_lock(:k)"), {"k": SCHEMA_LOCK})
+        Base.metadata.create_all(conn)
+    add_missing_columns(eng)
+
+
+init_schema()
 
 
 def record(**kw) -> None:

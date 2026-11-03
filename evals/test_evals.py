@@ -23,7 +23,7 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from app import graph, llm, sops, weather  # noqa: E402
+from app import fakes, graph, limits, llm, sops, weather  # noqa: E402
 
 LIVE = pytest.mark.skipif(not os.getenv("GEMINI_API_KEY"), reason="needs GEMINI_API_KEY")
 SOP_DIR = sops.SOP_DIR
@@ -682,26 +682,13 @@ def test_31_chat_rejects_bad_input_and_rate_limits(monkeypatch):
     assert [client.post("/chat", json=ok, headers=spoofed).status_code for _ in range(2)] == [200, 429]
 
 
-class FakeGemini:
-    """Stands in for google-genai's client so the real `_generate` path - retries,
-    usage counting, schema parsing - runs with no key and no network."""
+class FakeGemini(fakes.FakeModel):
+    """The app's own fake model (the one load tests use), with no delay, so the real
+    `_generate` path - retries, budget, usage counting, schema parsing - runs with no
+    key and no network."""
 
     def __init__(self, reply="Heavy rain today: 118.4 mm. Stay indoors.", fail=None):
-        self.models, self.reply, self.fail = self, reply, fail
-
-    def generate_content(self, model, contents, config):
-        if self.fail:
-            raise self.fail
-        from types import SimpleNamespace as NS
-
-        schema = config.response_schema
-        parsed = None
-        if schema is llm.Parsed:
-            parsed = llm.Parsed(location="Malabo", window="today")
-        elif schema is not None:
-            parsed = schema(sop_ids=["EX-UV-PEAK"], reasoning="stub")
-        meta = NS(prompt_token_count=100, candidates_token_count=20)
-        return NS(parsed=parsed, text=self.reply, usage_metadata=meta)
+        super().__init__(latency_ms=0, reply=reply, fail=fail)
 
 
 def test_32_every_turn_records_cost_latency_and_request_id(monkeypatch):
@@ -771,3 +758,107 @@ def test_34_an_old_audit_database_gains_the_new_columns(tmp_path):
         s.commit()
         rows = s.execute(text("SELECT question, latency_ms, request_id FROM audit_log ORDER BY id")).all()
     assert [tuple(r) for r in rows] == [("q", 0, ""), ("q2", 12, "")]
+
+
+# ------------------------------------------------------------ scale-out cases
+
+def test_35_rate_limit_is_shared_across_replicas_and_fails_open():
+    """CHECK: with the bucket in process memory, two replicas meant twice the limit,
+    and N replicas meant N times. A Redis outage must not take the bot down with it.
+    PASS: two limiters on one Redis share a burst of 3; with Redis unreachable every
+    request is allowed and the failure is counted."""
+    fakeredis = pytest.importorskip("fakeredis")
+    from app import metrics
+
+    r = fakeredis.FakeRedis()
+    a = limits.RedisRateLimiter(r, burst=3, per_minute=1)
+    b = limits.RedisRateLimiter(r, burst=3, per_minute=1)
+    assert [a.take("ip"), b.take("ip"), a.take("ip")] == [0, 0, 0]
+    assert b.take("ip") > 0, "the fourth request across both replicas must wait"
+    assert a.take("other-ip") == 0
+
+    class Down:
+        def register_script(self, _):
+            def run(**kw):
+                raise ConnectionError("redis down")
+            return run
+
+    before = metrics.LIMITER_ERRORS._value.get()
+    down = limits.RedisRateLimiter(Down(), burst=1, per_minute=1)
+    assert [down.take("ip") for _ in range(3)] == [0, 0, 0]
+    assert metrics.LIMITER_ERRORS._value.get() == before + 3
+
+
+def test_36_daily_model_budget_refuses_honestly_and_resets(monkeypatch):
+    """CHECK: on the free tier the real limit is a daily cap shared by every visitor,
+    and the first sign of hitting it used to be a model error mid-turn.
+    PASS: past MODEL_DAILY_CALL_BUDGET the turn ends `unavailable` with a reply that
+    says the demo is out of calls for today, no model call is made, and the next UTC
+    day starts a fresh count - in memory and in Redis."""
+    import datetime as dt
+
+    fakeredis = pytest.importorskip("fakeredis")
+    day = [dt.datetime(2026, 11, 3, 23, 0, tzinfo=dt.timezone.utc)]
+    for store in (None, fakeredis.FakeRedis()):
+        budget = limits.DailyBudget(2, store, clock=lambda: day[0])
+        day[0] = dt.datetime(2026, 11, 3, 23, 0, tzinfo=dt.timezone.utc)
+        assert [budget.take(), budget.take(), budget.take()] == [True, True, False]
+        day[0] = dt.datetime(2026, 11, 4, 0, 1, tzinfo=dt.timezone.utc)
+        assert budget.take(), "a new UTC day starts a new budget"
+
+    replay(monkeypatch, "heavy_rain_derived.json")
+    model = FakeGemini()
+    calls = []
+    original = model.generate_content
+    model.generate_content = lambda *a, **k: calls.append(1) or original(*a, **k)
+    monkeypatch.setattr(llm, "_client", model)
+    monkeypatch.setattr(limits, "budget", limits.DailyBudget(0))
+    assert ask("Bike ride in Malabo today?")["outcome"] == "answered", "0 means no budget"
+    monkeypatch.setattr(limits, "budget", limits.DailyBudget(1))
+    calls.clear()
+    r = ask("Bike ride in Malabo today?")
+    assert r["outcome"] == "unavailable" and "today's model budget" in r["answer"]
+    assert len(calls) == 1, "the call past the budget is never sent"
+
+
+def test_37_metrics_count_turns_without_exposing_questions(monkeypatch):
+    """CHECK: logs and the audit table answered "what happened", nothing answered
+    "how is it doing" without reading rows.
+    PASS: /metrics counts the turn by outcome, its latency, model calls and tokens;
+    no question text or place appears; METRICS_TOKEN closes it."""
+    from fastapi.testclient import TestClient
+
+    from app import api
+
+    replay(monkeypatch, "heavy_rain_derived.json")
+    monkeypatch.setattr(llm, "_client", FakeGemini())
+    monkeypatch.setattr(api, "limiter", api.RateLimiter(burst=5, per_minute=60))
+    client = TestClient(api.app)
+    q = "Secret question about Malabo cycling?"
+    assert client.post("/chat", json={"session_id": "m1", "message": q}).status_code == 200
+
+    body = client.get("/metrics").text
+    assert 'advisory_turns_total{outcome="answered"}' in body
+    assert "advisory_turn_latency_seconds_bucket" in body
+    assert "advisory_model_calls_total" in body and 'direction="input"' in body
+    assert "Secret question" not in body and "Malabo" not in body
+
+    monkeypatch.setenv("METRICS_TOKEN", "m3")
+    assert client.get("/metrics").status_code == 401
+    assert client.get("/metrics", headers={"Authorization": "Bearer m3"}).status_code == 200
+
+
+def test_38_fake_mode_runs_the_real_service_without_google_or_open_meteo(monkeypatch):
+    """CHECK: load tests need the service's own cost, not Google's latency or quota.
+    PASS: with MODEL_PROVIDER=fake and WEATHER_FIXTURE set, a turn goes through the
+    real graph, guard and audit, makes zero network calls, and is answered."""
+    monkeypatch.setenv("MODEL_PROVIDER", "fake")
+    monkeypatch.setenv("WEATHER_FIXTURE", str(FIXTURES / "heavy_rain_derived.json"))
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    monkeypatch.setattr(llm, "_client", None)
+    monkeypatch.setattr(fakes, "_fixture", None)
+    monkeypatch.setattr(httpx, "get", lambda *a, **k: pytest.fail("network used in fake mode"))
+    r = ask("Is it safe to cycle in Malabo today?")
+    assert r["outcome"] == "answered" and r["citation"] is not None
+    assert r["weather"]["place"].startswith("Malabo")
+    monkeypatch.setattr(llm, "_client", None)

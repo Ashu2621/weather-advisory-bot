@@ -4,16 +4,15 @@ import logging
 import os
 import pathlib
 import secrets
-import threading
-import time
 import uuid
-from collections import OrderedDict
 
 from fastapi import FastAPI, Header, HTTPException, Query, Request
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, Response
+from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from pydantic import BaseModel, Field
 
-from . import db, graph, sops
+from . import db, graph, limits, metrics, sops
+from .limits import RateLimiter  # noqa: F401  (re-exported for tests)
 
 WEB = pathlib.Path(__file__).resolve().parent.parent / "web"
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"), format="%(message)s")
@@ -21,34 +20,7 @@ log = logging.getLogger("advisory")
 app = FastAPI(title="Weather Advisory Support Bot")
 
 
-class RateLimiter:
-    """Token bucket per client. Every visitor of the public demo shares one free-tier
-    model quota, and a turn costs up to three model calls, so one script looping on
-    /chat would otherwise spend the day's quota for everyone. In-process only: with
-    more than one replica this belongs in the gateway or Redis."""
-
-    def __init__(self, burst: int, per_minute: float, max_clients: int = 10_000):
-        self.burst, self.rate, self.max_clients = burst, per_minute / 60, max_clients
-        self._buckets: OrderedDict[str, tuple[float, float]] = OrderedDict()
-        self._lock = threading.Lock()
-
-    def take(self, key: str) -> float:
-        """0 if allowed, else seconds until the next request would be."""
-        now = time.monotonic()
-        with self._lock:
-            tokens, last = self._buckets.pop(key, (float(self.burst), now))
-            tokens = min(self.burst, tokens + (now - last) * self.rate)
-            wait = 0.0 if tokens >= 1 else (1 - tokens) / self.rate
-            self._buckets[key] = (tokens - 1 if tokens >= 1 else tokens, now)
-            if len(self._buckets) > self.max_clients:
-                self._buckets.popitem(last=False)
-            return wait
-
-
-limiter = RateLimiter(
-    burst=int(os.getenv("CHAT_BURST", "5")),
-    per_minute=float(os.getenv("CHAT_PER_MINUTE", "10")),
-)
+limiter = limits.make_limiter()
 
 
 @app.middleware("http")
@@ -104,6 +76,7 @@ def client_key(request: Request) -> str:
 @app.post("/chat")
 def chat(turn: Turn, request: Request) -> dict:
     if wait := limiter.take(client_key(request)):
+        metrics.RATE_LIMITED.inc()
         raise HTTPException(
             status_code=429,
             detail="too many questions, slow down a little",
@@ -141,3 +114,13 @@ def audit(
 @app.get("/health")
 def health() -> dict:
     return {"ok": True, "sops": len(sops.load())}
+
+
+@app.get("/metrics")
+def prometheus(authorization: str | None = Header(default=None)) -> Response:
+    """Counts and timings only, no questions or places. Open unless METRICS_TOKEN is
+    set, in which case the scraper sends it as a bearer token."""
+    expected = os.getenv("METRICS_TOKEN", "")
+    if expected and not secrets.compare_digest((authorization or "").encode(), f"Bearer {expected}".encode()):
+        raise HTTPException(status_code=401, detail="metrics need METRICS_TOKEN")
+    return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)

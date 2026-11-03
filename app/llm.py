@@ -21,6 +21,7 @@ from google import genai
 from google.genai import errors, types
 from pydantic import BaseModel, create_model
 
+from . import fakes, limits, metrics
 from .sops import SOP
 from .weather import LABELS, Snapshot
 
@@ -57,6 +58,8 @@ class ModelUnavailable(Exception):
 
 def client() -> genai.Client:
     global _client
+    if _client is None and os.getenv("MODEL_PROVIDER") == "fake":
+        _client = fakes.FakeModel()
     if _client is None:
         key = os.getenv("GEMINI_API_KEY")
         if not key:
@@ -66,13 +69,16 @@ def client() -> genai.Client:
 
 
 def _count(resp) -> None:
-    u = usage.get()
-    if u is None:
-        return
     meta = getattr(resp, "usage_metadata", None)
-    u["model_calls"] += 1
-    u["input_tokens"] += getattr(meta, "prompt_token_count", None) or 0
-    u["output_tokens"] += getattr(meta, "candidates_token_count", None) or 0
+    tokens_in = getattr(meta, "prompt_token_count", None) or 0
+    tokens_out = getattr(meta, "candidates_token_count", None) or 0
+    metrics.MODEL_CALLS.inc()
+    metrics.MODEL_TOKENS.labels("input").inc(tokens_in)
+    metrics.MODEL_TOKENS.labels("output").inc(tokens_out)
+    if (u := usage.get()) is not None:
+        u["model_calls"] += 1
+        u["input_tokens"] += tokens_in
+        u["output_tokens"] += tokens_out
 
 
 def _quota_details(err: errors.APIError) -> tuple[bool, float]:
@@ -95,6 +101,11 @@ def _generate(prompt: str, system: str, schema=None, temp: float = 0.0):
     if schema is not None:
         cfg.response_mime_type = "application/json"
         cfg.response_schema = schema
+    if not limits.budget.take():
+        metrics.BUDGET_EXHAUSTED.inc()
+        raise ModelUnavailable(
+            "this demo has used today's model budget; it resets at 00:00 UTC"
+        )
     slept = 0.0
     for attempt in range(RETRIES):
         try:

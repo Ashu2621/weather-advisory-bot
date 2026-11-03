@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import sqlite3
 import time
 from typing import Annotated, TypedDict
@@ -11,7 +12,7 @@ from typing import Annotated, TypedDict
 from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.graph import END, START, StateGraph
 
-from . import db, llm, sops
+from . import db, llm, metrics, sops
 from .weather import AmbiguousLocation, Snapshot, WeatherUnavailable, snapshot
 
 log = logging.getLogger("advisory")
@@ -220,12 +221,35 @@ def build(checkpoint_db: str | None = db.CHECKPOINT_DB):
         g.add_edge(n, "remember")
     g.add_edge("remember", END)
 
-    saver = None
-    if checkpoint_db:
-        conn = sqlite3.connect(checkpoint_db, check_same_thread=False)
-        saver = SqliteSaver(conn)
-        saver.setup()
-    return g.compile(checkpointer=saver)
+    return g.compile(checkpointer=_saver(checkpoint_db))
+
+
+def _saver(checkpoint_db: str | None):
+    """Session memory. Postgres when DATABASE_URL points at one, so a follow-up that
+    lands on another replica still finds the conversation; SQLite otherwise."""
+    if checkpoint_db is None:
+        return None
+    if db.PG_URL:
+        from langgraph.checkpoint.postgres import PostgresSaver
+        from psycopg.rows import dict_row
+        from psycopg_pool import ConnectionPool
+
+        pool = ConnectionPool(
+            db.PG_URL, min_size=1, max_size=int(os.getenv("PG_POOL_SIZE", "10")), open=True,
+            kwargs={"autocommit": True, "prepare_threshold": 0, "row_factory": dict_row},
+        )
+        saver = PostgresSaver(pool)
+        # Same race as the audit schema: serialise the checkpointer's migrations.
+        with pool.connection() as conn:
+            conn.execute("SELECT pg_advisory_lock(%s)", (db.SCHEMA_LOCK + 1,))
+            try:
+                saver.setup()
+            finally:
+                conn.execute("SELECT pg_advisory_unlock(%s)", (db.SCHEMA_LOCK + 1,))
+        return saver
+    saver = SqliteSaver(sqlite3.connect(checkpoint_db, check_same_thread=False))
+    saver.setup()
+    return saver
 
 
 _graph = None
@@ -249,6 +273,10 @@ def ask(session_id: str, question: str, request_id: str = "") -> dict:
     finally:
         llm.usage.reset(token)
     latency_ms = round((time.perf_counter() - started) * 1000)
+    metrics.TURNS.labels(out.get("outcome") or "error").inc()
+    metrics.TURN_LATENCY.observe(latency_ms / 1000)
+    if out.get("guard_tripped"):
+        metrics.GUARD_TRIPS.inc()
     snap = out.get("snapshot") or {}
     primary = sops.by_id(out["primary"]) if out.get("primary") else None
     log.info(json.dumps({
