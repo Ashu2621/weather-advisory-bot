@@ -91,10 +91,19 @@ def index() -> FileResponse:
     return FileResponse(WEB / "index.html")
 
 
+def client_key(request: Request) -> str:
+    """Who to rate-limit. Behind Render or any single proxy every request arrives from
+    the proxy's address, so one bucket would throttle all visitors together. The
+    proxy appends the real peer as the last X-Forwarded-For entry; earlier entries
+    are whatever the client claimed, so only the last one is trusted."""
+    if forwarded := request.headers.get("x-forwarded-for"):
+        return forwarded.rsplit(",", 1)[-1].strip()
+    return request.client.host if request.client else "unknown"
+
+
 @app.post("/chat")
 def chat(turn: Turn, request: Request) -> dict:
-    client = request.client.host if request.client else "unknown"
-    if wait := limiter.take(client):
+    if wait := limiter.take(client_key(request)):
         raise HTTPException(
             status_code=429,
             detail="too many questions, slow down a little",

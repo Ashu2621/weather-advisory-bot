@@ -671,6 +671,13 @@ def test_31_chat_rejects_bad_input_and_rate_limits(monkeypatch):
     assert r.status_code == 429 and int(r.headers["retry-after"]) >= 1
     assert api.limiter.take("another-client") == 0
 
+    # Behind a proxy, visitors are told apart by the address the proxy appended,
+    # not by what they put in the header themselves.
+    via = {"x-forwarded-for": "6.6.6.6, 203.0.113.7"}
+    assert client.post("/chat", json=ok, headers=via).status_code == 200
+    spoofed = {"x-forwarded-for": "1.2.3.4, 203.0.113.7"}
+    assert [client.post("/chat", json=ok, headers=spoofed).status_code for _ in range(2)] == [200, 429]
+
 
 class FakeGemini:
     """Stands in for google-genai's client so the real `_generate` path - retries,

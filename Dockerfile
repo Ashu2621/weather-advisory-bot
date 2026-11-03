@@ -19,5 +19,5 @@ EXPOSE 8000
 HEALTHCHECK --interval=30s --timeout=3s --start-period=10s \
   CMD python -c "import os, urllib.request; urllib.request.urlopen(f'http://127.0.0.1:{os.environ[\"PORT\"]}/health', timeout=2)"
 
-# --proxy-headers so the rate limiter sees the client, not the load balancer.
-CMD ["sh", "-c", "uvicorn app.api:app --host 0.0.0.0 --port $PORT --proxy-headers --forwarded-allow-ips='*'"]
+# The rate limiter keys on the last X-Forwarded-For hop, so it works behind one proxy.
+CMD ["sh", "-c", "uvicorn app.api:app --host 0.0.0.0 --port $PORT"]

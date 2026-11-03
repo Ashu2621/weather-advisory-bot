@@ -73,9 +73,8 @@ audit log and session memory reset on every redeploy; and every visitor shares o
 free-tier model quota, so when it runs out the bot says so rather than failing.
 
 Or as a container (`docker build -t advisory . && docker run -p 8000:8000 --env-file .env advisory`).
-The image runs as a non-root user, has a healthcheck on `/health`, and starts uvicorn
-with `--proxy-headers` so the rate limiter sees the real client behind a load balancer.
-CI builds it and checks it boots on every PR.
+The image runs as a non-root user and has a healthcheck on `/health`. CI builds it and
+checks it boots on every PR.
 
 | Endpoint | Purpose |
 |---|---|
@@ -95,7 +94,10 @@ What a turn is allowed to cost, and what it records:
 * **Rate limit** — token bucket per client IP on `/chat` (`CHAT_BURST`, default 5;
   `CHAT_PER_MINUTE`, default 10). Every visitor shares one model quota, and a turn is up
   to three model calls, so one looping script would otherwise spend the day's quota for
-  everyone. It is per process; with replicas it belongs in the gateway.
+  everyone. Behind Render's proxy every request comes from the proxy's address, so the
+  limiter keys on the last `X-Forwarded-For` entry, the one the proxy appended; earlier
+  entries are whatever the client claimed. It is per process; with replicas it belongs
+  in the gateway.
 * **Model timeouts** — each call has a 20 s HTTP timeout (`MODEL_TIMEOUT_MS`), and the
   429/503 retries share a 20 s sleep budget (`MODEL_RETRY_BUDGET_SECONDS`). Gemini's
   `retryDelay` is often a minute; honouring it held the user's request open that long.
