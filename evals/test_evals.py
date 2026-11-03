@@ -622,7 +622,9 @@ def test_29_ambiguous_place_names_get_a_question_not_a_guess(monkeypatch):
     monkeypatch.setattr(httpx, "get", fake_get)
     monkeypatch.setattr(llm, "extract", lambda q, h, last: llm.Parsed(
         location="Kochi, Kerala, India" if "Kerala" in q else "Kochi", window="today"))
-    monkeypatch.setattr(llm, "match", lambda q, h, c: (["EX-UV-PEAK"], "stub"))
+    # Matches only when the activity is in what it is shown, like the real matcher:
+    # "Kochi, Kerala, India" on its own is not a question about cycling.
+    monkeypatch.setattr(llm, "match", lambda q, h, c: (["EX-UV-PEAK"] if "cycle" in q else [], "stub"))
     monkeypatch.setattr(llm, "compose", lambda q, snap, sop, extra: (llm.template(snap, sop, extra), set()))
     sid = f"eval-{uuid.uuid4()}"
 
@@ -632,7 +634,8 @@ def test_29_ambiguous_place_names_get_a_question_not_a_guess(monkeypatch):
     assert "Japan" in first["answer"] and "India" in first["answer"]
 
     second = ask("Kochi, Kerala, India", sid)
-    assert second["outcome"] == "answered" and second["choices"] == []
+    assert second["outcome"] == "answered", "the answer to 'which Kochi?' lost the original question"
+    assert second["choices"] == [] and second["citation"] is not None
 
 
 def test_30_session_memory_is_bounded(monkeypatch):
