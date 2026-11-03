@@ -9,7 +9,7 @@ request after 15 idle minutes can take about a minute to wake the service.
 
 **Five minutes, in order:**
 
-1. `pytest evals -m "not live"` — 16 cases, no key, no network, about 3 seconds.
+1. `pytest evals -m "not live"` — 23 cases, no key, no network, about 3 seconds.
 2. With a key in `.env`: `uvicorn app.api:app`, open http://localhost:8000, ask
    *"is it safe to cycle in Bhopal today?"*
 3. The live 11th SOP — [Adding the 11th SOP live](#adding-the-11th-sop-live).
@@ -35,8 +35,10 @@ source .venv/bin/activate
 (Windows PowerShell: `.\.venv\Scripts\Activate.ps1`)
 
 ```bash
-pip install -r requirements.txt
+pip install -r requirements-dev.txt
 ```
+
+(`requirements.txt` is the runtime set the deploy installs; `-dev` adds pytest and ruff.)
 
 ```bash
 cp .env.example .env
@@ -70,13 +72,44 @@ Two consequences of the free tier worth knowing: the disk is ephemeral, so the S
 audit log and session memory reset on every redeploy; and every visitor shares one
 free-tier model quota, so when it runs out the bot says so rather than failing.
 
+Or as a container (`docker build -t advisory . && docker run -p 8000:8000 --env-file .env advisory`).
+The image runs as a non-root user, has a healthcheck on `/health`, and starts uvicorn
+with `--proxy-headers` so the rate limiter sees the real client behind a load balancer.
+CI builds it and checks it boots on every PR.
+
 | Endpoint | Purpose |
 |---|---|
 | `GET /` | chat UI |
-| `POST /chat` | `{session_id, message}` → answer + citation + the readings used |
+| `POST /chat` | `{session_id, message}` → answer + citation + the readings used. Message ≤ 500 chars; per-client rate limit (429 + `retry-after`) |
 | `GET /sops` | the live policy catalogue |
-| `GET /audit?token=…` | decision trail, newest first — closed unless `AUDIT_TOKEN` is set (`local-dev` in `.env.example`) |
+| `GET /audit` | decision trail, newest first. Needs `Authorization: Bearer <AUDIT_TOKEN>` or `X-Audit-Token`; closed when `AUDIT_TOKEN` is unset |
 | `GET /health` | liveness + SOP count |
+
+Every response carries an `x-request-id` (yours if you send one), and the same id is on
+the turn's audit row and its log line.
+
+### Running it for more than a demo
+
+What a turn is allowed to cost, and what it records:
+
+* **Rate limit** — token bucket per client IP on `/chat` (`CHAT_BURST`, default 5;
+  `CHAT_PER_MINUTE`, default 10). Every visitor shares one model quota, and a turn is up
+  to three model calls, so one looping script would otherwise spend the day's quota for
+  everyone. It is per process; with replicas it belongs in the gateway.
+* **Model timeouts** — each call has a 20 s HTTP timeout (`MODEL_TIMEOUT_MS`), and the
+  429/503 retries share a 20 s sleep budget (`MODEL_RETRY_BUDGET_SECONDS`). Gemini's
+  `retryDelay` is often a minute; honouring it held the user's request open that long.
+  Past the budget the turn ends as `unavailable` and says the model is rate-limited.
+* **Cost per turn** — the audit row records latency, the number of model calls and
+  input/output tokens, and one JSON log line per turn carries the same numbers. That
+  turns "the first thing to change under real load" (gap 5) into something measurable.
+* **Bounded memory** — a session keeps its last 20 turns. The checkpointer rewrites the
+  whole state on every step, so an uncapped list grows the database quadratically.
+* **Geocoding is cached** for a day (512 names), which takes one of the two Open-Meteo
+  calls off every follow-up turn. Forecasts are not cached: they are the facts.
+* **Schema upgrades** — new audit columns are added in place on startup, so an
+  `audit.db` from the previous version keeps working (`test_34`). Anything beyond
+  additive columns needs a real migration tool.
 
 ## Evals
 
@@ -138,7 +171,8 @@ Three branch points, not decoration, and the failure path is reachable from all
 three. `unavailable` is one node with two causes — the weather API (or geocoding)
 failing, or the model failing — and in both the bot says which, and gives no advice.
 `match → no_match` is the honest-refusal path; `parse → need_location` catches a
-question with no city in it or anywhere earlier in the session.
+question with no city in it or anywhere earlier in the session, and `fetch → need_location`
+asks which place is meant when the name is ambiguous ("Kochi").
 
 A model failure in `compose` is the one place that does *not* route to `unavailable`:
 by then the policy is chosen and the numbers are real, so the deterministic template is
@@ -369,14 +403,17 @@ for the user; it does not answer it for the business three weeks later.
 
 `audit_log` stores, per turn: the question, the resolved location, **the exact weather
 values the decision used**, every candidate SOP, every match, the primary, the severity,
-whether the number guard tripped, and the final text. `GET /audit` reads it back. That
+whether the number guard tripped, the final text, and what the turn cost (latency,
+model calls, tokens, request id). `GET /audit` reads it back. That
 makes "why did it say that" reconstructable after the fact, including what the weather
 was at the time — which no live re-query can recover.
 
 Because it holds every user's questions, `/audit` is **closed unless `AUDIT_TOKEN` is
 set and supplied**, and an unset variable means closed, not open. The first live
 deployment got this wrong: `/audit` was world-readable on the public URL, found by
-checking the deployment rather than trusting it. `test_27`.
+checking the deployment rather than trusting it. The token is accepted in a header only;
+the first version also took `?token=`, which puts the secret in proxy logs and browser
+history. `test_27`.
 
 SQLite so there is nothing to install; SQLAlchemy so `DATABASE_URL` can point at
 Postgres without a code change (it needs a driver such as `psycopg[binary]` added to
@@ -387,11 +424,12 @@ adding a policy should drop a file, not write SQL.
 
 ## Eval results
 
-Run on **2026-09-18**, `gemini-3.5-flash-lite`, live Open-Meteo.
+Cases 01–27: run on **2026-09-18**, `gemini-3.5-flash-lite`, live Open-Meteo.
 **28 passed, 0 failed, 0 skipped, in 3 m 13 s** (`EVAL_PACE_SECONDS=4`; most of that is
-free-tier rate-limit waits). Sixteen of the twenty-eight need neither a key nor a
-network: `pytest evals -m "not live"`. Several cases exist because something failed
-first — 02b, 08, 22, 24, 26 and 27 — and each is marked in the table with what it found.
+free-tier rate-limit waits). Cases 28–34 were added on 2026-11-03 and are all offline;
+the 23 offline cases pass in CI on every PR. The live cases have not been re-run since
+the 2026-11-03 changes. Several cases exist because something failed first — 02b, 08,
+22, 24, 26, 27, 28 and 29 — and each is marked in the table with what it found.
 
 | # | Case | What it checks | Pass looks like | Result |
 |---|---|---|---|---|
@@ -422,7 +460,14 @@ first — 02b, 08, 22, 24, 26 and 27 — and each is marked in the table with wh
 | 24 | **Model outage** | The model fails too: no key, spent quota, outage | `unavailable`, no citation, says what is wrong — not an HTTP 500 | ✅ pass — **failed first** (was a 500) |
 | 25 | **No policy gap for exercise** | Threshold rules leave holes between gates | Over 2,268 readings straddling every threshold, exactly one of `EX-FAVOURABLE` / `EX-CAUTION-BAND` applies | ✅ pass |
 | 26 | **Only readings that fired reach the reply** | An in-range reading presented as a concern — real number, so the guard cannot see it | Fact sheet and fallback carry exactly the clauses that fired; in-range gusts absent | ✅ pass — found live, see *Honest gaps* #4 |
-| 27 | **Audit log is not public** | The first deployment served every visitor's questions at `/audit` | Closed with no token configured, closed with a wrong one, open with the right one | ✅ pass — found on the live deployment |
+| 27 | **Audit log is not public** | The first deployment served every visitor's questions at `/audit` | Closed with no token configured, closed with a wrong one or one in the URL, open with the right header | ✅ pass — found on the live deployment |
+| 28 | **Number guard reads signs and commas** | A correct sub-zero reply was flagged as invented | `-12.4` and `24,140` grounded; a flipped sign caught; dates and time ranges not read as negatives | ✅ pass — **failed first**, see *Honest gaps* #4 |
+| 29 | **Ambiguous place names** | "Kochi" answered for Japan without asking | Comparable places in different countries get a question with choices; London and "Kochi, India" answer directly | ✅ pass — closes *Honest gaps* #3 |
+| 30 | Bounded session memory | The checkpoint grew with every turn | 25 turns leave the last 20 | ✅ pass |
+| 31 | `/chat` input and rate limit | Public endpoint on a shared quota | 501-char message and bad session id are 422 before any model call; burst exhausted gives 429 + `retry-after` | ✅ pass |
+| 32 | **Cost and trace per turn** | Real model wrapper with a fake client, no key | Audit row has 3 model calls, their tokens, latency and the echoed request id | ✅ pass |
+| 33 | Retry budget | A 60 s `retryDelay` held the request open | No sleep past the budget; turn ends `unavailable` | ✅ pass |
+| 34 | Old audit database | `create_all` never adds columns | New columns added in place, old rows kept | ✅ pass |
 
 ### Case 13 in full — the situational override on live data
 
@@ -542,15 +587,15 @@ wrong answer would be most damaging.
    mechanism is already the right shape to carry it, and would need no code change
    beyond a new field in `weather.snapshot`.
 
-3. **Geocoding takes the first result silently, and it is sometimes the wrong
-   continent.** The brief permits this, and the reply always names the resolved place
-   in full ("Bhopal, Madhya Pradesh, India") so a wrong pick is visible rather than
-   hidden. It is a real failure mode though, and I hit it twice while building:
-   **"Kochi"** resolves to **Kochi, Japan**, not Kochi, Kerala; and **"Sohra"** — the
-   current name of Cherrapunji, one of the wettest places on earth — resolves to
-   **Sohra, Saxony, Germany**. Both are silent. There is no disambiguation prompt; the
-   honest fix is to return the candidate list when the top results sit in different
-   countries and ask the user, which is a UI change as much as a code one.
+3. **Geocoding used to take the first result silently** — now closed, mostly.
+   **"Kochi"** resolved to **Kochi, Japan**, not Kochi, Kerala; **"Sohra"** — the
+   current name of Cherrapunji — to **Sohra, Saxony, Germany**. The resolver now asks
+   when a same-named place in *another country* is at least 30 % the size of the top
+   hit (`weather.rivals`), and the page shows the choices as buttons. The threshold is
+   what stops it pestering: London, Ontario is 5 % of London, England, so "London"
+   still just answers. A name with no population data on either side always asks.
+   What is still open: same-country ambiguity (five Springfields in the US) is not
+   asked about, and the 30 % is a judgement call, not something I measured.
 
 4. **The number guard only sees digits.** Two known ways past it, one closed and one
    open:
@@ -571,10 +616,14 @@ wrong answer would be most damaging.
      misuse. `test_26`. What remains open is a claim with no reading behind it at
      all ("winds are picking up sharply"); only the guidance text constrains that.
 
-   A related false positive is now fixed and worth naming, because it is the kind of
-   bug that makes a guard useless: the model was quoting raw column names, and
-   `wind_gusts_10m` made the guard read a claim of "10". The fact sheet now uses
-   digit-free labels and `_nums` strips field identifiers before matching.
+   Two false positives are now fixed and worth naming, because they are the kind of
+   bug that makes a guard useless. The model was quoting raw column names, and
+   `wind_gusts_10m` made the guard read a claim of "10"; the fact sheet now uses
+   digit-free labels and `_nums` strips field identifiers before matching. And the
+   regex dropped minus signs, so in any city below zero a correct "feels like -12.4"
+   was rejected as an invented 12.4 and every answer fell back to the template; it also
+   read "24,140 m" as 24 and 140. Signs and thousands separators are now part of the
+   number, a flipped sign is still caught, and hyphens in dates are not signs. `test_28`.
 
 5. **Three LLM calls per turn** (extract, match, compose) against a free tier whose
    real constraint turned out to be a **per-day** cap, not a per-minute one.
@@ -583,7 +632,8 @@ wrong answer would be most damaging.
    daily cap only burns wall-clock, and an early version of this code spent 31 minutes
    proving it. Merging `extract` into `match` is not possible — the numeric gate needs
    the weather, which needs the location — but `extract` and `compose` could both move
-   to a cheaper model. This is the first thing to change under real load.
+   to a cheaper model. This is the first thing to change under real load, and the
+   audit log now records calls and tokens per turn, so the change can be measured.
 
 ### A note on model choice
 
@@ -618,4 +668,5 @@ app/api.py       FastAPI, serves the frontend too
 sops/*.yaml      the policies
 web/index.html   chat UI, vanilla JS, no build step
 evals/           the eval suite
+Dockerfile       the deployable image; .github/workflows/ci.yml lints, tests, builds it
 ```
