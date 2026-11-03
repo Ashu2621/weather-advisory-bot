@@ -78,11 +78,21 @@ FRESH_TURN: dict = {
 }
 
 
+def _asked(state: State) -> str:
+    """What the policies should be matched against. After "which Kochi?" the reply is
+    just a place name, and matching that alone finds no activity and answers no-match,
+    so the question that prompted the clarification is carried into this turn."""
+    turns = state.get("turns", [])
+    if turns and turns[-1].get("choices"):
+        return f"{turns[-1]['question']} ({state['question']})"
+    return state["question"]
+
+
 def parse(state: State) -> dict:
     turns = state.get("turns", [])
     last = next((t.get("location") for t in reversed(turns) if t.get("location")), None)
     try:
-        p = llm.extract(state["question"], _history(turns), last)
+        p = llm.extract(_asked(state), _history(turns), last)
     except llm.ModelUnavailable as e:
         return {**FRESH_TURN, "error": str(e), "error_kind": "model"}
     return {**FRESH_TURN, "location": p.location or last, "window": p.window, "activity": p.activity}
@@ -102,7 +112,7 @@ def match(state: State) -> dict:
     snap = Snapshot(**state["snapshot"])
     eligible = [s for s in sops.load() if s.eligible(snap.values)]
     try:
-        ids, why = llm.match(state["question"], _history(state.get("turns", [])), eligible)
+        ids, why = llm.match(_asked(state), _history(state.get("turns", [])), eligible)
     except llm.ModelUnavailable as e:
         return {"candidates": [s.id for s in eligible], "error": str(e), "error_kind": "model"}
     hits = sops.apply_overrides(eligible, [s for s in eligible if s.id in ids])
@@ -123,7 +133,7 @@ def compose(state: State) -> dict:
     primary = sops.by_id(state["primary"])
     extra = [sops.by_id(i) for i in state.get("secondary", [])]
     try:
-        answer, bad = llm.compose(state["question"], snap, primary, extra)
+        answer, bad = llm.compose(_asked(state), snap, primary, extra)
         if bad:
             answer = llm.template(snap, primary, extra)
     except llm.ModelUnavailable:
