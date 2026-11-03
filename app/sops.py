@@ -127,7 +127,6 @@ def apply_overrides(eligible: list[SOP], intent_matched: list[SOP]) -> list[SOP]
 def rank_matches(matched: list[SOP]) -> tuple[SOP, list[SOP]]:
     """Conflict policy: an `overrides` SOP wins outright, else highest severity.
     Ties break on the order SOPs are declared. Returns (primary, secondary)."""
-    ordered = sorted(
-        matched, key=lambda s: (not s.overrides, -s.rank, [x.id for x in load()].index(s.id))
-    )
+    order = {s.id: i for i, s in enumerate(load())}
+    ordered = sorted(matched, key=lambda s: (not s.overrides, -s.rank, order.get(s.id, len(order))))
     return ordered[0], ordered[1:]

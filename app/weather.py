@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import time
 from statistics import mean
 
 import httpx
@@ -69,6 +70,25 @@ class WeatherUnavailable(Exception):
     """Raised for every failure mode: geocoding empty, network down, bad response."""
 
 
+class AmbiguousLocation(Exception):
+    """The name matches comparable places in different countries. Not a failure: the
+    bot asks which one instead of silently answering for the wrong continent."""
+
+    def __init__(self, city: str, options: list[str]):
+        super().__init__(f"{city!r} matches {len(options)} places")
+        self.city = city
+        self.options = options
+
+
+# A second country's match only counts as a real alternative when it is at least this
+# big relative to the top hit. London, Ontario is 5% of London, England and nobody
+# asking about "London" means it; Kochi, Kerala is twice the size of Kochi, Japan.
+RIVAL_POPULATION = 0.3
+GEO_TTL_S = 24 * 3600
+GEO_CACHE_SIZE = 512
+_geo_cache: dict[str, tuple[float, list[dict]]] = {}
+
+
 class Snapshot(BaseModel):
     place: str
     latitude: float
@@ -88,16 +108,51 @@ def _get(url: str, params: dict) -> dict:
         raise WeatherUnavailable(f"{url.split('/')[2]} did not respond: {e}") from e
 
 
+def _label(r: dict) -> str:
+    return ", ".join(str(x) for x in (r.get("name"), r.get("admin1"), r.get("country")) if x)
+
+
+def _search(city: str) -> list[dict]:
+    """Geocoding results, cached for a day. Places don't move, and the cache takes one
+    of the two network calls off every follow-up turn. Misses are not cached."""
+    key = " ".join(city.lower().split())
+    hit = _geo_cache.get(key)
+    if hit and time.monotonic() - hit[0] < GEO_TTL_S:
+        return hit[1]
+    results = _get(GEO_URL, {"name": city, "count": 5, "format": "json"}).get("results") or []
+    if results:
+        if len(_geo_cache) >= GEO_CACHE_SIZE:
+            _geo_cache.pop(next(iter(_geo_cache)))
+        _geo_cache[key] = (time.monotonic(), results)
+    return results
+
+
+def rivals(city: str, results: list[dict]) -> list[str]:
+    """Labels of the top hit plus same-named places in other countries that are big
+    enough to be what the user meant. Empty when the top hit is the obvious reading.
+    A qualified name ("Kochi, India") is taken as already disambiguated."""
+    if "," in city or len(results) < 2:
+        return []
+    top = results[0]
+    floor = (top.get("population") or 0) * RIVAL_POPULATION
+    seen = {top.get("country_code")}
+    out = [_label(top)]
+    for r in results[1:]:
+        same_name = r.get("name", "").casefold() == top.get("name", "").casefold()
+        if same_name and r.get("country_code") not in seen and (r.get("population") or 0) >= floor:
+            seen.add(r.get("country_code"))
+            out.append(_label(r))
+    return out if len(out) > 1 else []
+
+
 def resolve(city: str) -> tuple[float, float, str]:
-    data = _get(GEO_URL, {"name": city, "count": 1, "format": "json"})
-    results = data.get("results") or []
+    results = _search(city)
     if not results:
         raise WeatherUnavailable(f"no location matches {city!r}")
+    if options := rivals(city, results):
+        raise AmbiguousLocation(city, options)
     top = results[0]
-    label = ", ".join(
-        str(x) for x in (top.get("name"), top.get("admin1"), top.get("country")) if x
-    )
-    return top["latitude"], top["longitude"], label
+    return top["latitude"], top["longitude"], _label(top)
 
 
 def snapshot(city: str, window: str = "now") -> Snapshot:
