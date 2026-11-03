@@ -108,6 +108,11 @@ function decorate(node, r) {
 async function send(text) {
   add('user', text);
   const pending = add('bot', 'Checking live weather…');
+  // The demo runs on a free instance that sleeps when idle; say so instead of
+  // leaving a spinner for the minute it takes to wake.
+  const slow = setTimeout(() => {
+    pending.textContent = 'Still working. The free server may be waking up, which takes up to a minute…';
+  }, 6000);
   try {
     const res = await fetch('/chat', {
       method: 'POST',
@@ -119,9 +124,11 @@ async function send(text) {
       const detail = typeof r.detail === 'string' ? r.detail : r.error;
       throw new Error(detail || `server returned ${res.status}`);
     }
+    clearTimeout(slow);
     pending.textContent = r.answer;
     decorate(pending, r);
   } catch (err) {
+    clearTimeout(slow);
     pending.textContent = err instanceof TypeError
       ? 'Cannot reach the backend. Start it with  uvicorn app.api:app --port 8000  and open http://localhost:8000'
       : `Error: ${err.message}`;
@@ -152,9 +159,11 @@ if (location.protocol === 'file:') {
   document.getElementById('input').disabled = true;
 }
 
+const meta = document.getElementById('meta');
+const waking = setTimeout(() => { meta.textContent = 'Waking the free server up (about a minute)…'; }, 2500);
 fetch('/health').then(r => r.json())
-  .then(h => document.getElementById('meta').textContent = h.error ? h.error : `${h.sops} SOPs loaded`)
-  .catch(() => {});
+  .then(h => { clearTimeout(waking); meta.textContent = h.error ? h.error : `${h.sops} SOPs loaded`; })
+  .catch(() => clearTimeout(waking));
 </script>
 </body>
 </html>
