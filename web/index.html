@@ -30,6 +30,8 @@
   table { border-collapse:collapse; margin-top:7px; font-size:12.5px; }
   td { padding:2px 12px 2px 0; color:var(--dim); } td.v { color:var(--text); font-variant-numeric:tabular-nums; }
   .warn { margin-top:7px; color:#e0913c; font-size:12.5px; }
+  .choices { margin-top:8px; display:flex; flex-wrap:wrap; gap:6px; }
+  .choices button { font-size:12.5px; padding:4px 9px; }
   form { display:flex; gap:8px; padding:14px 16px; border-top:1px solid var(--line); }
   input { flex:1; background:var(--panel); border:1px solid var(--line); color:var(--text);
           border-radius:8px; padding:11px 13px; font-size:15px; }
@@ -45,7 +47,7 @@
   </header>
   <div id="log"></div>
   <form id="form" autocomplete="off">
-    <input id="input" placeholder="Is it safe to cycle to work in Bhopal today?" required>
+    <input id="input" placeholder="Is it safe to cycle to work in Bhopal today?" maxlength="500" required>
     <button type="submit">Send</button>
   </form>
 </div>
@@ -68,6 +70,16 @@ function add(cls, text) {
 }
 
 function decorate(node, r) {
+  if (r.choices?.length) {
+    const row = el('div', 'choices');
+    for (const c of r.choices) {
+      const b = el('button', null, c);
+      b.type = 'button';
+      b.onclick = () => send(c);
+      row.append(b);
+    }
+    node.append(row);
+  }
   const box = el('div', 'cite');
   if (r.citation) {
     const tag = el('span', 'tag', r.citation.severity);
@@ -93,12 +105,7 @@ function decorate(node, r) {
   node.append(box);
 }
 
-document.getElementById('form').onsubmit = async (e) => {
-  e.preventDefault();
-  const input = document.getElementById('input');
-  const text = input.value.trim();
-  if (!text) return;
-  input.value = '';
+async function send(text) {
   add('user', text);
   const pending = add('bot', 'Checking live weather…');
   try {
@@ -108,7 +115,10 @@ document.getElementById('form').onsubmit = async (e) => {
       body: JSON.stringify({ session_id: session, message: text }),
     });
     const r = await res.json().catch(() => ({}));
-    if (!res.ok) throw new Error(r.error || `server returned ${res.status}`);
+    if (!res.ok) {
+      const detail = typeof r.detail === 'string' ? r.detail : r.error;
+      throw new Error(detail || `server returned ${res.status}`);
+    }
     pending.textContent = r.answer;
     decorate(pending, r);
   } catch (err) {
@@ -117,6 +127,15 @@ document.getElementById('form').onsubmit = async (e) => {
       : `Error: ${err.message}`;
   }
   log.scrollTop = log.scrollHeight;
+}
+
+document.getElementById('form').onsubmit = (e) => {
+  e.preventDefault();
+  const input = document.getElementById('input');
+  const text = input.value.trim();
+  if (!text) return;
+  input.value = '';
+  send(text);
 };
 
 document.getElementById('reset').onclick = () => {

@@ -2,15 +2,28 @@
 the three can end in the same honest `unavailable` reply."""
 from __future__ import annotations
 
-import operator
+import json
+import logging
 import sqlite3
+import time
 from typing import Annotated, TypedDict
 
 from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.graph import END, START, StateGraph
 
 from . import db, llm, sops
-from .weather import Snapshot, WeatherUnavailable, snapshot
+from .weather import AmbiguousLocation, Snapshot, WeatherUnavailable, snapshot
+
+log = logging.getLogger("advisory")
+
+# The prompt only ever shows the last six turns, but the checkpointer stores the whole
+# list on every step of every turn, so an uncapped list grows the database
+# quadratically for a long session. Twenty is enough to resolve any follow-up.
+MAX_TURNS = 20
+
+
+def keep_recent(old: list[dict], new: list[dict]) -> list[dict]:
+    return (old + new)[-MAX_TURNS:]
 
 NO_MATCH = (
     "I don't have a policy covering that, so I won't guess. I can advise on outdoor "
@@ -20,8 +33,9 @@ NO_MATCH = (
 
 class State(TypedDict, total=False):
     question: str
-    turns: Annotated[list[dict], operator.add]
+    turns: Annotated[list[dict], keep_recent]
     location: str | None
+    choices: list[str]
     window: str
     activity: str | None
     snapshot: dict | None
@@ -40,11 +54,16 @@ class State(TypedDict, total=False):
 def _history(turns: list[dict]) -> str:
     if not turns:
         return "(no earlier turns)"
-    return "Earlier in this conversation:\n" + "\n".join(
-        f"- user asked {t['question']!r} about {t.get('place') or 'an unknown place'}"
-        f" ({t.get('window', 'now')}); policy applied: {t.get('primary') or 'none'}"
-        for t in turns[-6:]
-    )
+    lines = []
+    for t in turns[-6:]:
+        line = (
+            f"- user asked {t['question']!r} about {t.get('place') or 'an unknown place'}"
+            f" ({t.get('window', 'now')}); policy applied: {t.get('primary') or 'none'}"
+        )
+        if t.get("choices"):
+            line += f"; bot asked them to pick one of: {' | '.join(t['choices'])}"
+        lines.append(line)
+    return "Earlier in this conversation:\n" + "\n".join(lines)
 
 
 # Everything a single turn computes. The checkpointer persists *all* state on a thread,
@@ -52,7 +71,7 @@ def _history(turns: list[dict]) -> str:
 # turn's value forward - e.g. a stale `primary` routing an off-topic question to
 # `compose` with the last answer's citation. Only `turns` is memory.
 FRESH_TURN: dict = {
-    "location": None, "window": "now", "activity": None, "snapshot": None,
+    "location": None, "choices": [], "window": "now", "activity": None, "snapshot": None,
     "error": None, "error_kind": None, "candidates": [], "matched": [],
     "primary": None, "secondary": [], "reasoning": "", "guard_tripped": [],
     "answer": "", "outcome": "",
@@ -73,6 +92,8 @@ def fetch(state: State) -> dict:
     try:
         snap = snapshot(state["location"], state.get("window", "now"))
         return {"snapshot": snap.model_dump(), "error": None}
+    except AmbiguousLocation as e:
+        return {"snapshot": None, "choices": e.options}
     except WeatherUnavailable as e:
         return {"snapshot": None, "error": str(e), "error_kind": "weather"}
 
@@ -131,6 +152,16 @@ def unavailable(state: State) -> dict:
 
 
 def need_location(state: State) -> dict:
+    if options := state.get("choices"):
+        return {
+            "answer": (
+                f"{state['location']} matches more than one place: "
+                + "; ".join(options)
+                + ". Which one do you mean? Add the state or country, e.g. "
+                f"\"{options[1]}\"."
+            ),
+            "outcome": "need_location",
+        }
     return {
         "answer": "Which city should I check? I need a location before I can advise.",
         "outcome": "need_location",
@@ -147,6 +178,7 @@ def remember(state: State) -> dict:
                 "place": snap.get("place"),
                 "window": state.get("window", "now"),
                 "primary": state.get("primary"),
+                "choices": state.get("choices", []),
                 "answer": state.get("answer", ""),
             }
         ]
@@ -165,8 +197,9 @@ def build(checkpoint_db: str | None = db.CHECKPOINT_DB):
         ["unavailable", "fetch", "need_location"],
     )
     g.add_conditional_edges(
-        "fetch", lambda s: "unavailable" if s.get("error") else "match",
-        ["unavailable", "match"],
+        "fetch",
+        lambda s: "unavailable" if s.get("error") else "need_location" if s.get("choices") else "match",
+        ["unavailable", "need_location", "match"],
     )
     g.add_conditional_edges(
         "match",
@@ -195,14 +228,29 @@ def agent():
     return _graph
 
 
-def ask(session_id: str, question: str) -> dict:
-    out = agent().invoke(
-        {"question": question}, {"configurable": {"thread_id": session_id}}
-    )
+def ask(session_id: str, question: str, request_id: str = "") -> dict:
+    spent = {"model_calls": 0, "input_tokens": 0, "output_tokens": 0}
+    token = llm.usage.set(spent)
+    started = time.perf_counter()
+    try:
+        out = agent().invoke(
+            {"question": question}, {"configurable": {"thread_id": session_id}}
+        )
+    finally:
+        llm.usage.reset(token)
+    latency_ms = round((time.perf_counter() - started) * 1000)
     snap = out.get("snapshot") or {}
     primary = sops.by_id(out["primary"]) if out.get("primary") else None
+    log.info(json.dumps({
+        "event": "turn", "request_id": request_id, "outcome": out.get("outcome", ""),
+        "primary": out.get("primary"), "guard_tripped": bool(out.get("guard_tripped")),
+        "latency_ms": latency_ms, **spent,
+    }))
     db.record(
         session_id=session_id,
+        request_id=request_id,
+        latency_ms=latency_ms,
+        **spent,
         question=question,
         outcome=out.get("outcome", ""),
         place=snap.get("place", ""),
@@ -229,6 +277,7 @@ def ask(session_id: str, question: str) -> dict:
             else None
         ),
         "also": out.get("secondary", []),
+        "choices": out.get("choices", []),
         "weather": snap,
         "guard_tripped": out.get("guard_tripped", []),
     }

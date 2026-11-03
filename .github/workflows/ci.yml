@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python: ["3.10", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+          cache-dependency-path: requirements*.txt
+      - run: pip install -r requirements-dev.txt
+      - run: ruff check app evals
+      # Offline cases only: no key, no network. The live ones need GEMINI_API_KEY.
+      - run: pytest evals -m "not live" -v
+
+  image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build -t advisory .
+      - name: Boot and check /health
+        run: |
+          docker run -d --name bot -p 8000:8000 advisory
+          for i in $(seq 1 20); do
+            curl -fsS localhost:8000/health && exit 0
+            sleep 1
+          done
+          docker logs bot
+          exit 1

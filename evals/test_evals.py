@@ -50,6 +50,14 @@ def _pace(request):
         time.sleep(PACE)
 
 
+@pytest.fixture(autouse=True)
+def _fresh_geocoding_cache():
+    """A cached geocode from one case would hide another case's stubbed outage."""
+    weather._geo_cache.clear()
+    yield
+    weather._geo_cache.clear()
+
+
 FIXTURES = pathlib.Path(__file__).resolve().parent / "fixtures"
 
 
@@ -504,7 +512,7 @@ def test_27_audit_log_is_closed_unless_a_token_is_configured(monkeypatch):
     """CHECK: the audit log stores every visitor's questions, and the first live
     deployment served it to anyone who opened /audit.
     PASS: closed with no token configured, closed with a wrong one, open with the
-    right one - as a query parameter or a header."""
+    right one - in a header. Never as a query parameter, which lands in proxy logs."""
     from fastapi.testclient import TestClient
 
     from app import api
@@ -514,9 +522,12 @@ def test_27_audit_log_is_closed_unless_a_token_is_configured(monkeypatch):
     assert client.get("/audit").status_code == 401, "unset must mean closed"
 
     monkeypatch.setenv("AUDIT_TOKEN", "s3cret")
-    assert client.get("/audit", params={"token": "wrong"}).status_code == 401
-    assert client.get("/audit", params={"token": "s3cret"}).status_code == 200
+    assert client.get("/audit", headers={"X-Audit-Token": "wrong"}).status_code == 401
+    assert client.get("/audit", params={"token": "s3cret"}).status_code == 401, "no tokens in URLs"
     assert client.get("/audit", headers={"X-Audit-Token": "s3cret"}).status_code == 200
+    assert client.get("/audit", headers={"Authorization": "Bearer s3cret"}).status_code == 200
+    assert client.get("/audit", params={"limit": 100000},
+                      headers={"X-Audit-Token": "s3cret"}).status_code == 422
 
 
 @pytest.mark.live
@@ -532,3 +543,228 @@ def test_21_full_graph_on_recorded_severe_weather(monkeypatch):
     assert r["citation"]["id"] == "SIT-HEAVY-RAIN-SYSTEM"
     assert "118.4" in r["answer"], "the recorded rainfall total must reach the user"
     assert ungrounded(r) == set()
+
+
+# ------------------------------------------------------------- hardening cases
+
+def test_28_number_guard_reads_signs_and_thousands():
+    """CHECK: the guard parses numbers the way a reader does. It used to drop the
+    minus sign, so a correct sub-zero reply ("feels like -12.4") was flagged as an
+    invented 12.4 and replaced by the template in every cold city; and "24,140 m"
+    read as two invented numbers, 24 and 140.
+    PASS: signed and comma-grouped readings are grounded; a flipped sign is not;
+    hyphens inside dates and time ranges are not read as signs."""
+    snap = weather.Snapshot(
+        place="Leh, Ladakh, India", latitude=0, longitude=0, window="morning",
+        observed_at="2026-01-10 06:00-11:59 local",
+        values={"apparent_temperature": -12.4, "visibility": 24140.0}, units={},
+    )
+    allowed = llm.allowed_numbers(snap, [])
+    assert llm.bad_numbers("It feels like -12.4 C in Leh.", allowed) == set()
+    assert llm.bad_numbers("It feels like −12.4 C.", allowed) == set()
+    assert llm.bad_numbers("Visibility is 24,140 m.", allowed) == set()
+    assert llm.bad_numbers("It feels like 12.4 C.", allowed) == {12.4}, "sign flip is a wrong number"
+    assert llm.bad_numbers("Between 06:00-11:59 on 2026-01-10.", allowed) == set()
+
+
+# Captured from geocoding-api.open-meteo.com on 2026-11-03 (count=5), trimmed to the
+# fields the resolver reads.
+GEO = {
+    "Kochi": [
+        {"name": "Kochi", "admin1": "Kochi", "country": "Japan", "country_code": "JP",
+         "population": 332059, "latitude": 33.56, "longitude": 133.53},
+        {"name": "Kochi", "admin1": "Kerala", "country": "India", "country_code": "IN",
+         "population": 633553, "latitude": 9.94, "longitude": 76.26},
+    ],
+    "London": [
+        {"name": "London", "admin1": "England", "country": "United Kingdom",
+         "country_code": "GB", "population": 8961989, "latitude": 51.5, "longitude": -0.13},
+        {"name": "London", "admin1": "Ontario", "country": "Canada", "country_code": "CA",
+         "population": 422324, "latitude": 42.98, "longitude": -81.23},
+    ],
+    "Sohra": [
+        {"name": "Sohra", "admin1": "Saxony", "country": "Germany", "country_code": "DE",
+         "latitude": 51.04, "longitude": 13.83},
+        {"name": "Sohra", "admin1": "Uttar Pradesh", "country": "India",
+         "country_code": "IN", "latitude": 26.9, "longitude": 80.9},
+    ],
+}
+
+
+def test_29_ambiguous_place_names_get_a_question_not_a_guess(monkeypatch):
+    """CHECK: honest gap #3 from the first version. "Kochi" silently resolved to
+    Kochi, Japan and "Sohra" to a village in Germany, and the bot answered for them.
+    PASS: comparable same-named places in different countries produce a question
+    listing them; a dominant city (London) and a qualified name answer directly;
+    the question goes through the graph as need_location with the choices attached."""
+    assert weather.rivals("Kochi", GEO["Kochi"]) == ["Kochi, Kochi, Japan", "Kochi, Kerala, India"]
+    assert len(weather.rivals("Sohra", GEO["Sohra"])) == 2, "no population data means ask"
+    assert weather.rivals("London", GEO["London"]) == []
+    assert weather.rivals("Kochi, India", GEO["Kochi"]) == []
+
+    data = json.loads((FIXTURES / "heavy_rain_derived.json").read_text(encoding="utf-8"))
+
+    class Resp:
+        def __init__(self, payload):
+            self._p = payload
+
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return self._p
+
+    def fake_get(url, params=None, **kw):
+        if "geocoding-api" in url:
+            return Resp({"results": GEO.get(params["name"]) or data["geocoding"]["results"]})
+        return Resp(data["forecast"])
+
+    monkeypatch.setattr(httpx, "get", fake_get)
+    monkeypatch.setattr(llm, "extract", lambda q, h, last: llm.Parsed(
+        location="Kochi, Kerala, India" if "Kerala" in q else "Kochi", window="today"))
+    monkeypatch.setattr(llm, "match", lambda q, h, c: (["EX-UV-PEAK"], "stub"))
+    monkeypatch.setattr(llm, "compose", lambda q, snap, sop, extra: (llm.template(snap, sop, extra), set()))
+    sid = f"eval-{uuid.uuid4()}"
+
+    first = ask("Can I cycle in Kochi today?", sid)
+    assert first["outcome"] == "need_location" and first["citation"] is None
+    assert first["choices"] == ["Kochi, Kochi, Japan", "Kochi, Kerala, India"]
+    assert "Japan" in first["answer"] and "India" in first["answer"]
+
+    second = ask("Kochi, Kerala, India", sid)
+    assert second["outcome"] == "answered" and second["choices"] == []
+
+
+def test_30_session_memory_is_bounded(monkeypatch):
+    """CHECK: the checkpointer writes the whole state on every step, so an uncapped
+    turn list grows the checkpoint database quadratically over a long session.
+    PASS: after 25 turns the thread holds the last MAX_TURNS, newest last."""
+    monkeypatch.setattr(llm, "extract", lambda q, h, last: llm.Parsed(location=None))
+    sid = f"eval-{uuid.uuid4()}"
+    for i in range(graph.MAX_TURNS + 5):
+        assert ask(f"question {i}", sid)["outcome"] == "need_location"
+    turns = graph.agent().get_state({"configurable": {"thread_id": sid}}).values["turns"]
+    assert len(turns) == graph.MAX_TURNS
+    assert turns[-1]["question"] == f"question {graph.MAX_TURNS + 4}"
+
+
+def test_31_chat_rejects_bad_input_and_rate_limits(monkeypatch):
+    """CHECK: /chat is public and every turn spends the shared model quota.
+    PASS: an oversized message or a malformed session id is a 422 before any model
+    call; a client past its burst gets a 429 with retry-after; others are unaffected."""
+    from fastapi.testclient import TestClient
+
+    from app import api
+
+    calls = []
+    monkeypatch.setattr(graph, "ask", lambda sid, q, rid="": calls.append(q) or {"answer": "ok"})
+    monkeypatch.setattr(api, "limiter", api.RateLimiter(burst=2, per_minute=1))
+    client = TestClient(api.app)
+
+    assert client.post("/chat", json={"session_id": "s1", "message": "x" * 501}).status_code == 422
+    assert client.post("/chat", json={"session_id": "../etc", "message": "hi"}).status_code == 422
+    assert calls == []
+
+    ok = {"session_id": "s1", "message": "Is it safe to cycle in Bhopal?"}
+    assert [client.post("/chat", json=ok).status_code for _ in range(3)] == [200, 200, 429]
+    r = client.post("/chat", json=ok)
+    assert r.status_code == 429 and int(r.headers["retry-after"]) >= 1
+    assert api.limiter.take("another-client") == 0
+
+    # Behind a proxy, visitors are told apart by the address the proxy appended,
+    # not by what they put in the header themselves.
+    via = {"x-forwarded-for": "6.6.6.6, 203.0.113.7"}
+    assert client.post("/chat", json=ok, headers=via).status_code == 200
+    spoofed = {"x-forwarded-for": "1.2.3.4, 203.0.113.7"}
+    assert [client.post("/chat", json=ok, headers=spoofed).status_code for _ in range(2)] == [200, 429]
+
+
+class FakeGemini:
+    """Stands in for google-genai's client so the real `_generate` path - retries,
+    usage counting, schema parsing - runs with no key and no network."""
+
+    def __init__(self, reply="Heavy rain today: 118.4 mm. Stay indoors.", fail=None):
+        self.models, self.reply, self.fail = self, reply, fail
+
+    def generate_content(self, model, contents, config):
+        if self.fail:
+            raise self.fail
+        from types import SimpleNamespace as NS
+
+        schema = config.response_schema
+        parsed = None
+        if schema is llm.Parsed:
+            parsed = llm.Parsed(location="Malabo", window="today")
+        elif schema is not None:
+            parsed = schema(sop_ids=["EX-UV-PEAK"], reasoning="stub")
+        meta = NS(prompt_token_count=100, candidates_token_count=20)
+        return NS(parsed=parsed, text=self.reply, usage_metadata=meta)
+
+
+def test_32_every_turn_records_cost_latency_and_request_id(monkeypatch):
+    """CHECK: "why did it say that" was answerable, "what did it cost" was not.
+    PASS: one answered turn through the real model wrapper records three model
+    calls, their tokens, a latency, and the request id the API echoed back."""
+    from fastapi.testclient import TestClient
+
+    from app import api, db
+
+    replay(monkeypatch, "heavy_rain_derived.json")
+    monkeypatch.setattr(llm, "_client", FakeGemini())
+    monkeypatch.setattr(api, "limiter", api.RateLimiter(burst=5, per_minute=60))
+    sid = f"eval-{uuid.uuid4()}"
+    r = TestClient(api.app).post(
+        "/chat", json={"session_id": sid, "message": "Bike ride in Malabo today?"},
+        headers={"X-Request-ID": "req-abc"},
+    )
+    assert r.status_code == 200 and r.headers["x-request-id"] == "req-abc"
+    assert r.json()["outcome"] == "answered" and r.json()["guard_tripped"] == []
+
+    row = db.recent(1, sid)[0]
+    assert row["request_id"] == "req-abc"
+    assert (row["model_calls"], row["input_tokens"], row["output_tokens"]) == (3, 300, 60)
+    assert row["latency_ms"] >= 0
+
+
+def test_33_rate_limited_model_fails_within_the_retry_budget(monkeypatch):
+    """CHECK: a 429 asking for a 60 s retryDelay used to be honoured, holding the
+    user's request open for a minute per attempt.
+    PASS: a wait that would exceed MODEL_RETRY_BUDGET_SECONDS is not slept; the turn
+    fails fast as ModelUnavailable, which the graph turns into an honest refusal."""
+    from google.genai import errors
+
+    err = errors.APIError(429, {"error": {"code": 429, "message": "slow down",
+                                          "details": [{"retryDelay": "60s"}]}})
+    slept = []
+    monkeypatch.setattr(llm.time, "sleep", slept.append)
+    monkeypatch.setattr(llm, "_client", FakeGemini(fail=err))
+    with pytest.raises(llm.ModelUnavailable, match="rate-limited"):
+        llm.extract("Cycling in Bhopal?", "", None)
+    assert slept == []
+    assert ask("Is it safe to cycle in Bhopal today?")["outcome"] == "unavailable"
+
+
+def test_34_an_old_audit_database_gains_the_new_columns(tmp_path):
+    """CHECK: create_all never alters an existing table, so an audit.db written by the
+    previous version would fail every insert after an upgrade.
+    PASS: the missing columns are added in place and old rows survive."""
+    from sqlalchemy import create_engine, text
+    from sqlalchemy.orm import Session
+
+    from app import db
+
+    eng = create_engine(f"sqlite:///{tmp_path / 'old.db'}")
+    with eng.begin() as c:
+        c.execute(text("CREATE TABLE audit_log (id INTEGER PRIMARY KEY, ts DATETIME, "
+                       "session_id VARCHAR(64), question TEXT, outcome VARCHAR(24), "
+                       "place VARCHAR(160), window VARCHAR(16), weather TEXT, candidates TEXT, "
+                       "matched TEXT, primary_sop VARCHAR(48), severity VARCHAR(16), "
+                       "guard_tripped TEXT, answer TEXT)"))
+        c.execute(text("INSERT INTO audit_log (session_id, question, outcome) "
+                       "VALUES ('s', 'q', 'no_match')"))
+    db.add_missing_columns(eng)
+    with Session(eng) as s:
+        s.add(db.Decision(session_id="s", question="q2", outcome="answered", latency_ms=12))
+        s.commit()
+        rows = s.execute(text("SELECT question, latency_ms, request_id FROM audit_log ORDER BY id")).all()
+    assert [tuple(r) for r in rows] == [("q", 0, ""), ("q2", 12, "")]
