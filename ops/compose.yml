@@ -1,0 +1,70 @@
+# Two replicas behind nginx, sharing Postgres (session memory + audit) and Redis
+# (rate limit + daily budget). Model and weather are faked so the stack runs with no
+# keys and no network:  docker compose -f ops/compose.yml up -d --build --wait
+# then:                 docker compose -f ops/compose.yml run --rm --no-deps check
+
+x-app: &app
+  build: ..
+  environment:
+    DATABASE_URL: postgresql://bot:bot@postgres:5432/advisory
+    REDIS_URL: redis://redis:6379/0
+    MODEL_PROVIDER: fake
+    FAKE_MODEL_LATENCY_MS: ${FAKE_MODEL_LATENCY_MS:-0}
+    WEATHER_FIXTURE: /fixtures/heavy_rain_derived.json
+    AUDIT_TOKEN: stack-audit
+    CHAT_BURST: ${CHAT_BURST:-4}
+    CHAT_PER_MINUTE: ${CHAT_PER_MINUTE:-2}
+    LOG_LEVEL: WARNING
+  volumes:
+    - ../evals/fixtures:/fixtures:ro
+  depends_on:
+    postgres: {condition: service_healthy}
+    redis: {condition: service_healthy}
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment: {POSTGRES_USER: bot, POSTGRES_PASSWORD: bot, POSTGRES_DB: advisory}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U bot -d advisory"]
+      interval: 2s
+      retries: 30
+
+  redis:
+    image: redis:7-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      retries: 30
+
+  app1: *app
+  app2: *app
+
+  nginx:
+    image: nginx:1.27-alpine
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      app1: {condition: service_healthy}
+      app2: {condition: service_healthy}
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1/health"]
+      interval: 2s
+      retries: 30
+
+  prometheus:
+    image: prom/prometheus:v3.5.0
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./alerts.yml:/etc/prometheus/alerts.yml:ro
+    depends_on: [app1, app2]
+
+  check:
+    image: python:3.12-slim
+    profiles: [tools]
+    volumes:
+      - .:/ops:ro
+      - ../loadtest:/loadtest:ro
+    depends_on:
+      nginx: {condition: service_healthy}
+    command: python /ops/stack_check.py

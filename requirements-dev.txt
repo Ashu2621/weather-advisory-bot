@@ -1,3 +1,5 @@
 -r requirements.txt
 pytest==9.1.1
 ruff==0.14.0
+fakeredis==2.40.0
+lupa==2.8

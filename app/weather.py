@@ -8,6 +8,8 @@ from statistics import mean
 import httpx
 from pydantic import BaseModel
 
+from . import fakes
+
 GEO_URL = "https://geocoding-api.open-meteo.com/v1/search"
 FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
 TIMEOUT = 10.0
@@ -100,6 +102,8 @@ class Snapshot(BaseModel):
 
 
 def _get(url: str, params: dict) -> dict:
+    if (rec := fakes.recorded(url)) is not None:
+        return rec.json()
     try:
         r = httpx.get(url, params=params, timeout=TIMEOUT)
         r.raise_for_status()

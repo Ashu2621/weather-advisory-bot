@@ -9,7 +9,7 @@ request after 15 idle minutes can take about a minute to wake the service.
 
 **Five minutes, in order:**
 
-1. `pytest evals -m "not live"` — 23 cases, no key, no network, about 3 seconds.
+1. `pytest evals -m "not live and not remote"` — 27 cases, no key, no network, about 4 seconds.
 2. With a key in `.env`: `uvicorn app.api:app`, open http://localhost:8000, ask
    *"is it safe to cycle in Bhopal today?"*
 3. The live 11th SOP — [Adding the 11th SOP live](#adding-the-11th-sop-live).
@@ -98,8 +98,8 @@ What a turn is allowed to cost, and what it records:
   to three model calls, so one looping script would otherwise spend the day's quota for
   everyone. Behind Render's proxy every request comes from the proxy's address, so the
   limiter keys on the last `X-Forwarded-For` entry, the one the proxy appended; earlier
-  entries are whatever the client claimed. It is per process; with replicas it belongs
-  in the gateway.
+  entries are whatever the client claimed. With `REDIS_URL` set, the bucket lives in
+  Redis and every replica draws from it; without, it is per process.
 * **Model timeouts** — each call has a 20 s HTTP timeout (`MODEL_TIMEOUT_MS`), and the
   429/503 retries share a 20 s sleep budget (`MODEL_RETRY_BUDGET_SECONDS`). Gemini's
   `retryDelay` is often a minute; honouring it held the user's request open that long.
@@ -114,6 +114,60 @@ What a turn is allowed to cost, and what it records:
 * **Schema upgrades** — new audit columns are added in place on startup, so an
   `audit.db` from the previous version keeps working (`test_34`). Anything beyond
   additive columns needs a real migration tool.
+* **Daily model budget** — `MODEL_DAILY_CALL_BUDGET` caps model calls per UTC day
+  across all replicas (Redis when set). Set a little under the free tier's daily cap,
+  the bot says "this demo has used today's model budget; it resets at 00:00 UTC"
+  instead of failing mid-turn when Google cuts it off. Unset or 0 means no budget.
+
+### Scaling out
+
+One process with SQLite is the default because it needs nothing installed. For more
+than one replica, set two variables and nothing else changes:
+
+| Shared state | Single process | With replicas |
+|---|---|---|
+| Session memory (LangGraph checkpoints) | SQLite file | Postgres, `DATABASE_URL` |
+| Audit log | SQLite file | Postgres, `DATABASE_URL` |
+| Rate limit, daily budget | in memory | Redis, `REDIS_URL` |
+
+`ops/compose.yml` runs two replicas behind nginx on shared Postgres and Redis, with
+Prometheus, and the model and weather faked so it needs no keys. CI brings it up from
+an empty database on every PR and runs `ops/stack_check.py`, which checks that a
+follow-up answered by the *other* replica still knows the city, that the rate limit
+is one budget across replicas rather than one each, and that both replicas write one
+audit log. Bringing it up the first time found a real bug: both replicas created the
+tables at once and one crashed, so schema setup now runs under a Postgres advisory
+lock. If Redis goes down, the limiter and budget fail open and count the errors;
+the bot keeps answering.
+
+```bash
+docker compose -f ops/compose.yml up -d --build --wait
+docker compose -f ops/compose.yml run --rm --no-deps check
+```
+
+### Load
+
+Two replicas, fake model, on a 12-core laptop: about **70-80 turns/s** with **p95 217 ms
+at 10 users**, zero errors at 100 users. With 300 ms per model call (0.9 s of model
+time per turn), 50 users get **p95 1.03 s**, so the service adds about 40 ms on top of
+the model. Full tables, method and what would raise the ceiling:
+[loadtest/RESULTS.md](loadtest/RESULTS.md). The real limit in production is the
+model quota, long before either number.
+
+### Metrics and alerts
+
+`GET /metrics` (Prometheus) counts turns by outcome, turn latency, model calls and
+tokens, guard trips, 429s, budget refusals and limiter errors. It carries no question
+text or place names (`test_37`); `METRICS_TOKEN` closes it. `ops/alerts.yml` has six
+rules, checked with `promtool` in CI: more than 20% of turns `unavailable`, p95 above
+8 s, guard trips above 10% of answers, budget exhausted, limiter degraded, replica down.
+
+### Load tests and the stack without Google
+
+`MODEL_PROVIDER=fake` swaps Gemini for a deterministic client
+(`FAKE_MODEL_LATENCY_MS` adds a delay per call) and `WEATHER_FIXTURE=<path>` serves a
+recorded Open-Meteo exchange. Both are off unless set. Everything else (graph, guard,
+audit, limits) runs for real (`test_38`).
 
 ## Evals
 
@@ -121,7 +175,15 @@ What a turn is allowed to cost, and what it records:
 pytest evals -v
 ```
 
-Live tests skip automatically when `GEMINI_API_KEY` is unset. Results are in
+Live tests skip automatically when `GEMINI_API_KEY` is unset. The same live cases
+also run over HTTP against a deployed instance, using that instance's own key:
+
+```bash
+EVAL_BASE_URL=https://weather-advisory-bot-5evh.onrender.com pytest evals -m remote -v
+```
+
+`.github/workflows/live-eval.yml` does that every morning against the demo, so the
+real model is checked daily without its key ever leaving Render. Results are in
 [Eval results](#eval-results) below.
 
 ---
@@ -430,10 +492,15 @@ adding a policy should drop a file, not write SQL.
 
 Cases 01–27: run on **2026-09-18**, `gemini-3.5-flash-lite`, live Open-Meteo.
 **28 passed, 0 failed, 0 skipped, in 3 m 13 s** (`EVAL_PACE_SECONDS=4`; most of that is
-free-tier rate-limit waits). Cases 28–34 were added on 2026-11-03 and are all offline;
-the 23 offline cases pass in CI on every PR. The live cases have not been re-run since
-the 2026-11-03 changes. Several cases exist because something failed first — 02b, 08,
-22, 24, 26, 27, 28 and 29 — and each is marked in the table with what it found.
+free-tier rate-limit waits). Cases 28–38 were added on 2026-11-03 and are all offline;
+the 27 offline cases pass in CI on every PR.
+
+**Remote run, 2026-11-03**, against the deployed demo after those changes, real Gemini:
+**9 passed, 0 failed** in 2 m 48 s (`test_remote.py`: 08–12, 14, 16, 17, and the
+two-turn "which Kochi?" case). Case 13 (severe live weather) and the outage cases
+15/18 stay in-process only, since they need the network stubbed. Several cases exist
+because something failed first — 02b, 08, 22, 24, 26, 27, 28 and 29 — and each is
+marked in the table with what it found.
 
 | # | Case | What it checks | Pass looks like | Result |
 |---|---|---|---|---|
@@ -472,6 +539,10 @@ the 2026-11-03 changes. Several cases exist because something failed first — 0
 | 32 | **Cost and trace per turn** | Real model wrapper with a fake client, no key | Audit row has 3 model calls, their tokens, latency and the echoed request id | ✅ pass |
 | 33 | Retry budget | A 60 s `retryDelay` held the request open | No sleep past the budget; turn ends `unavailable` | ✅ pass |
 | 34 | Old audit database | `create_all` never adds columns | New columns added in place, old rows kept | ✅ pass |
+| 35 | **Shared rate limit** | Per-process buckets meant N replicas, N times the limit | Two limiters on one Redis share one burst; Redis down fails open and is counted | ✅ pass |
+| 36 | Daily model budget | Free-tier cap hit mid-turn | Past the budget: `unavailable`, says when it resets, no call sent; new UTC day resets | ✅ pass |
+| 37 | Metrics | No way to see health without reading rows | Turn, latency, calls, tokens counted; no question text; token closes it | ✅ pass |
+| 38 | Fake mode | Load tests must not measure Google | Full graph answered with zero network calls | ✅ pass |
 
 ### Case 13 in full — the situational override on live data
 
@@ -672,5 +743,10 @@ app/api.py       FastAPI, serves the frontend too
 sops/*.yaml      the policies
 web/index.html   chat UI, vanilla JS, no build step
 evals/           the eval suite
+app/limits.py    rate limit + daily budget, in memory or Redis
+app/metrics.py   Prometheus counters
+app/fakes.py     fake model + recorded weather, for load tests and the stack
+ops/             compose stack (2 replicas, nginx, Postgres, Redis, Prometheus), alerts
+loadtest/        load generator and results
 Dockerfile       the deployable image; .github/workflows/ci.yml lints, tests, builds it
 ```

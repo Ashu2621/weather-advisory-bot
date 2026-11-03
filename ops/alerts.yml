@@ -1,0 +1,53 @@
+groups:
+  - name: advisory
+    rules:
+      # The bot refusing because weather or the model is down. A few are normal
+      # (free-tier quota, Open-Meteo blips); a sustained share is an outage.
+      - alert: AdvisoryUnavailableHigh
+        expr: |
+          sum(rate(advisory_turns_total{outcome="unavailable"}[10m]))
+            / clamp_min(sum(rate(advisory_turns_total[10m])), 1e-9) > 0.2
+          and sum(rate(advisory_turns_total[10m])) > 0.01
+        for: 10m
+        labels: {severity: page}
+        annotations:
+          summary: "More than 20% of turns end 'unavailable' (weather API or model down)"
+
+      - alert: AdvisorySlowTurns
+        expr: |
+          histogram_quantile(0.95, sum by (le) (rate(advisory_turn_latency_seconds_bucket[10m]))) > 8
+        for: 15m
+        labels: {severity: ticket}
+        annotations:
+          summary: "p95 turn latency above 8 s"
+
+      # The guard replacing a reply means the model invented a number. Rare is fine;
+      # a jump usually means a model or prompt change.
+      - alert: AdvisoryGuardTripsRising
+        expr: |
+          sum(rate(advisory_guard_trips_total[1h]))
+            / clamp_min(sum(rate(advisory_turns_total{outcome="answered"}[1h])), 1e-9) > 0.1
+        for: 30m
+        labels: {severity: ticket}
+        annotations:
+          summary: "More than 10% of answers fell back to the template (invented numbers)"
+
+      - alert: AdvisoryBudgetExhausted
+        expr: increase(advisory_budget_exhausted_total[15m]) > 0
+        labels: {severity: info}
+        annotations:
+          summary: "Daily model budget used up; the bot is refusing until 00:00 UTC"
+
+      - alert: AdvisoryLimiterDegraded
+        expr: increase(advisory_limiter_errors_total[5m]) > 0
+        for: 5m
+        labels: {severity: ticket}
+        annotations:
+          summary: "Redis errors: rate limit and budget are failing open"
+
+      - alert: AdvisoryReplicaDown
+        expr: up{job="advisory"} == 0
+        for: 2m
+        labels: {severity: page}
+        annotations:
+          summary: "A replica is not answering /metrics"
