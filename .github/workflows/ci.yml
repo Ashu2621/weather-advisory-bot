@@ -22,9 +22,10 @@ jobs:
           cache: pip
           cache-dependency-path: requirements*.txt
       - run: pip install -r requirements-dev.txt
-      - run: ruff check app evals
-      # Offline cases only: no key, no network. The live ones need GEMINI_API_KEY.
-      - run: pytest evals -m "not live" -v
+      - run: ruff check app evals ops loadtest
+      # Offline cases only. `live` needs GEMINI_API_KEY; `remote` runs nightly
+      # against the deployed demo (live-eval.yml).
+      - run: pytest evals -m "not live and not remote" -v
 
   image:
     runs-on: ubuntu-latest
@@ -40,3 +41,16 @@ jobs:
           done
           docker logs bot
           exit 1
+
+  # Two replicas behind nginx on shared Postgres and Redis: memory, rate limit and
+  # audit must hold across replicas, and both must start together on an empty DB.
+  stack:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker compose -f ops/compose.yml up -d --build --wait
+      - run: docker compose -f ops/compose.yml run --rm check
+      - name: Alert rules parse
+        run: docker run --rm -v "$PWD/ops:/ops:ro" --entrypoint promtool prom/prometheus:v3.5.0 check rules /ops/alerts.yml
+      - if: failure()
+        run: docker compose -f ops/compose.yml logs --tail 80
