@@ -68,6 +68,8 @@ the page says so if you try.
 The live demo is a Render free web service built straight from this repo:
 `pip install -r requirements.txt`, then `uvicorn app.api:app --host 0.0.0.0 --port $PORT`,
 with `GEMINI_API_KEY`, `GEMINI_MODEL` and `PYTHON_VERSION=3.13.1` set in the dashboard.
+A merge to `main` deploys on its own once CI passes (Render auto-deploy is set to
+"After CI Checks Pass"), so a red build never reaches the demo.
 Two consequences of the free tier worth knowing: the disk is ephemeral, so the SQLite
 audit log and session memory reset on every redeploy; and every visitor shares one
 free-tier model quota, so when it runs out the bot says so rather than failing.
