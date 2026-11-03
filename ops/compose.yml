@@ -1,7 +1,7 @@
 # Two replicas behind nginx, sharing Postgres (session memory + audit) and Redis
 # (rate limit + daily budget). Model and weather are faked so the stack runs with no
 # keys and no network:  docker compose -f ops/compose.yml up -d --build --wait
-# then:                 docker compose -f ops/compose.yml run --rm check
+# then:                 docker compose -f ops/compose.yml run --rm --no-deps check
 
 x-app: &app
   build: ..

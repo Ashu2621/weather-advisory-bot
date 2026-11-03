@@ -142,7 +142,7 @@ the bot keeps answering.
 
 ```bash
 docker compose -f ops/compose.yml up -d --build --wait
-docker compose -f ops/compose.yml run --rm check
+docker compose -f ops/compose.yml run --rm --no-deps check
 ```
 
 ### Load

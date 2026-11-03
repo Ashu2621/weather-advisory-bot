@@ -49,7 +49,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: docker compose -f ops/compose.yml up -d --build --wait
-      - run: docker compose -f ops/compose.yml run --rm check
+      - run: docker compose -f ops/compose.yml run --rm --no-deps check
       - name: Alert rules parse
         run: docker run --rm -v "$PWD/ops:/ops:ro" --entrypoint promtool prom/prometheus:v3.5.0 check rules /ops/alerts.yml
       - if: failure()
